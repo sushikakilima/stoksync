@@ -1,0 +1,2013 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<title>StokSync — Satu Stok Untuk Semua Toko</title>
+<meta name="description" content="StokSync: sinkronisasi stok & harga Shopee, Tokopedia, TikTok Shop, dan Lazada dalam satu dashboard untuk UMKM Indonesia." />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  /* Konfigurasi Tailwind: font Inter + warna brand */
+  tailwind.config = {
+    theme: {
+      extend: {
+        fontFamily: { sans: ['Inter', 'ui-sans-serif', 'system-ui', 'sans-serif'] },
+        colors: { brand: { 50:'#eef2ff', 100:'#e0e7ff', 500:'#6366f1', 600:'#4f46e5', 700:'#4338ca' } },
+      }
+    }
+  };
+</script>
+<style>
+  /* ===== StokSync custom styles ===== */
+  html { -webkit-tap-highlight-color: transparent; }
+  body { font-family: 'Inter', system-ui, sans-serif; background: #f6f7fb; }
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 8px; }
+  ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+  .anim-fade-up { animation: fadeUp .35s ease both; }
+  @keyframes popIn { from { opacity: 0; transform: scale(.96) translateY(8px); } to { opacity: 1; transform: scale(1) translateY(0); } }
+  .anim-pop { animation: popIn .22s ease both; }
+  @keyframes toastIn { from { opacity: 0; transform: translateX(24px); } to { opacity: 1; transform: translateX(0); } }
+  .anim-toast { animation: toastIn .25s ease both; }
+  @keyframes pulseDot { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.8); } }
+  .pulse-dot { animation: pulseDot 1.6s ease-in-out infinite; }
+  @keyframes shimmer { from { background-position: 200% 0; } to { background-position: -200% 0; } }
+  .skeleton { background: linear-gradient(90deg,#eef0f5 25%,#e2e6ee 37%,#eef0f5 63%); background-size: 400% 100%; animation: shimmer 1.3s ease infinite; }
+  @keyframes spinSlow { to { transform: rotate(360deg); } }
+  .spin { animation: spinSlow 1s linear infinite; }
+
+  .no-scrollbar::-webkit-scrollbar { display: none; }
+  .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  input[type=number]::-webkit-inner-spin-button { opacity: 1; }
+</style>
+<script src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+/* =====================================================================
+   STOKSYNC — Satu Stok Untuk Semua Toko
+   ---------------------------------------------------------------------
+   Arsitektur single-file:
+   - React 18 (UMD) + Tailwind Play CDN + Lucide icons
+   - Store: mini-store ala Zustand (useSyncExternalStore), 1 sumber state
+   - Database: localStorage key "stoksync_v1" — skema siap migrasi Supabase:
+       products, marketplaces, orders, sync_logs, settings, users
+   - Logic inti: handleOrder() — sinkronisasi stok atomik anti race-condition
+   ===================================================================== */
+const { useState, useEffect, useMemo, useRef, useCallback } = React;
+const useSyncExternalStore = React.useSyncExternalStore;
+
+/* ============================== UTIL ============================== */
+const uid = (p = 'id') => p + '_' + Math.random().toString(36).slice(2, 9) + Date.now().toString(36);
+const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+const fmtIDR = (n) => 'Rp' + Number(n || 0).toLocaleString('id-ID');
+const fmtNum = (n) => Number(n || 0).toLocaleString('id-ID');
+const fmtDate = (ts) => new Date(ts).toLocaleDateString('id-ID', { day: 'numeric', month: 'short', year: 'numeric' });
+const fmtTime = (ts) => new Date(ts).toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+
+/* Waktu relatif ala "2 detik lalu" untuk log realtime */
+function timeAgo(ts, now) {
+  const s = Math.max(0, Math.floor(((now || Date.now()) - ts) / 1000));
+  if (s < 5) return 'baru saja';
+  if (s < 60) return s + ' detik lalu';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + ' menit lalu';
+  const h = Math.floor(m / 60);
+  if (h < 24) return h + ' jam lalu';
+  const d = Math.floor(h / 24);
+  if (d < 7) return d + ' hari lalu';
+  return fmtDate(ts);
+}
+const dayKey = (ts) => { const d = new Date(ts); return d.getFullYear() + '-' + (d.getMonth()+1) + '-' + d.getDate(); };
+
+/* Unduh CSV dari array of objects */
+function downloadCSV(filename, rows) {
+  if (!rows.length) return;
+  const headers = Object.keys(rows[0]);
+  const esc = (v) => {
+    const s = String(v == null ? '' : v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  const csv = [headers.join(','), ...rows.map((r) => headers.map((h) => esc(r[h])).join(','))].join('\n');
+  const blob = new Blob(['\ufeff' + csv], { type: 'text/csv;charset=utf-8;' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+}
+
+/* Parser CSV sederhana (mendukung quoted field) */
+function parseCSV(text) {
+  const lines = text.replace(/\r/g, '').split('\n').filter((l) => l.trim() !== '');
+  if (lines.length < 2) return [];
+  const splitRow = (row) => {
+    const out = []; let cur = ''; let q = false;
+    for (let i = 0; i < row.length; i++) {
+      const c = row[i];
+      if (q) {
+        if (c === '"') { if (row[i+1] === '"') { cur += '"'; i++; } else q = false; }
+        else cur += c;
+      } else if (c === '"') q = true;
+      else if (c === ',') { out.push(cur.trim()); cur = ''; }
+      else cur += c;
+    }
+    out.push(cur.trim());
+    return out;
+  };
+  const headers = splitRow(lines[0]).map((h) => h.toLowerCase());
+  return lines.slice(1).map((ln) => {
+    const cells = splitRow(ln);
+    const o = {};
+    headers.forEach((h, i) => { o[h] = cells[i] || ''; });
+    return o;
+  });
+}
+
+/* ===================== KONSTANTA MARKETPLACE ===================== */
+const MP = [
+  { id: 'shopee',    name: 'Shopee',      color: '#EE4D2D', soft: '#FFF0EA', letter: 'S' },
+  { id: 'tokopedia', name: 'Tokopedia',   color: '#03AC0E', soft: '#EAF9EC', letter: 'T' },
+  { id: 'tiktok',    name: 'TikTok Shop', color: '#111111', soft: '#F1F1F6', letter: 'Tk' },
+  { id: 'lazada',    name: 'Lazada',      color: '#0F146D', soft: '#ECECFB', letter: 'L' },
+];
+const mpById = (id) => MP.find((m) => m.id === id) || MP[0];
+
+const BUYERS = ['Andini Pratiwi','Budi Santoso','Siti Rahayu','Agus Wijaya','Dewi Lestari','Rina Marlina','Joko Prasetyo','Maya Anggraini','Fajar Nugroho','Intan Permata','Hendra Gunawan','Lilis Suryani','Putri Ayu','Dimas Ramadhan','Nita Kurnia'];
+const randomBuyer = () => BUYERS[Math.floor(Math.random() * BUYERS.length)];
+
+/* ===================== MINI-STORE (ala Zustand) =====================
+   Satu sumber kebenaran. Semua update lewat setState dengan updater
+   function agar atomik — tidak ada race condition antar komponen.   */
+function createStore(initial) {
+  let state = initial;
+  const listeners = new Set();
+  const getState = () => state;
+  const setState = (partial) => {
+    const next = typeof partial === 'function' ? partial(state) : partial;
+    if (next === state) return;
+    state = Object.assign({}, state, next);
+    listeners.forEach((l) => l());
+    persistSoon();
+  };
+  const subscribe = (l) => { listeners.add(l); return () => listeners.delete(l); };
+  return { getState, setState, subscribe };
+}
+function useStore(sel) {
+  /* ala Zustand: snapshot = hasil selector, React bail-out bila identik */
+  return useSyncExternalStore(store.subscribe, () => (sel ? sel(store.getState()) : store.getState()));
+}
+
+/* ===================== PERSISTENCE (localStorage) =====================
+   Skema siap-Supabase: products | marketplaces | orders | sync_logs |
+   settings | users. Untuk migrasi, ganti loadPersisted/persistSoon
+   dengan Supabase client (lihat PANDUAN.md).                              */
+const LS_KEY = 'stoksync_v1';
+let persistTimer = null;
+function persistSoon() {
+  clearTimeout(persistTimer);
+  persistTimer = setTimeout(() => {
+    try {
+      const s = store.getState();
+      localStorage.setItem(LS_KEY, JSON.stringify({
+        products: s.products, marketplaces: s.marketplaces, orders: s.orders,
+        syncLogs: s.syncLogs, settings: s.settings, users: s.users, user: s.user,
+      }));
+    } catch (e) { /* storage penuh / mode privat: abaikan */ }
+  }, 250);
+}
+function loadPersisted() {
+  try { const raw = localStorage.getItem(LS_KEY); return raw ? JSON.parse(raw) : null; }
+  catch (e) { return null; }
+}
+
+/* ===================== SEED: 10 PRODUK UMKM ASLI =====================
+   [nama, sku, kategori, ikon lucide, gradien, stokMaster, hrgShopee, hrgTokopedia, hrgTiktok, hrgLazada] */
+const SEED_PRODUCTS = [
+  ['Kaos Polos Hitam Cotton Combed 30s', 'KOS-HTM-001', 'Fashion', 'shirt', 'from-slate-700 to-slate-900', 48, 45000, 47000, 43000, 46000],
+  ['Keripik Singkong Balado 250g', 'KRP-BLD-002', 'Makanan', 'cookie', 'from-amber-400 to-orange-600', 120, 18000, 19000, 17500, 18500],
+  ['Hijab Segiempat Voal Premium', 'HJB-VOL-003', 'Fashion', 'layers', 'from-rose-400 to-pink-600', 36, 55000, 57000, 52000, 56000],
+  ['Batik Tulis Klaten Motif Parang', 'BTK-PRG-004', 'Fashion', 'sparkles', 'from-indigo-500 to-purple-700', 15, 285000, 295000, 279000, 289000],
+  ['Madu Murni Hutan Sumbawa 500ml', 'MAD-HUT-005', 'Kesehatan', 'droplets', 'from-yellow-400 to-amber-600', 32, 95000, 98000, 92000, 96000],
+  ['Kopi Robusta Temanggung 200g', 'KOP-RBS-006', 'Minuman', 'coffee', 'from-stone-500 to-amber-800', 64, 38000, 39000, 36500, 38500],
+  ['Tas Anyaman Pandan Premium', 'TAS-PND-007', 'Kerajinan', 'shopping-bag', 'from-emerald-400 to-teal-600', 22, 75000, 78000, 72000, 76000],
+  ['Sambal Pecel Khas Madiun 200g', 'SBL-PCL-008', 'Makanan', 'flame', 'from-red-500 to-orange-600', 85, 25000, 26000, 24000, 25500],
+  ['Sepatu Sneakers Kanvas Putih', 'SPT-SNK-009', 'Fashion', 'footprints', 'from-sky-400 to-blue-600', 27, 129000, 135000, 125000, 132000],
+  ['Lilin Aromaterapi Lavender', 'LLN-LVN-010', 'Home & Living', 'sparkles', 'from-violet-400 to-purple-600', 40, 35000, 36000, 33500, 35500],
+];
+
+function buildSeed() {
+  const now = Date.now();
+  const products = SEED_PRODUCTS.map((p) => ({
+    id: uid('prd'), name: p[0], sku: p[1], category: p[2], icon: p[3], grad: p[4],
+    masterStock: p[5],
+    stocks: { shopee: p[5], tokopedia: p[5], tiktok: p[5], lazada: p[5] },
+    prices: { shopee: p[6], tokopedia: p[7], tiktok: p[8], lazada: p[9] },
+    createdAt: now,
+  }));
+  const marketplaces = [
+    { id: 'shopee', connected: true, apiKey: 'shp_•••• •••• 3f9a', lastSync: now - 4 * 60000 },
+    { id: 'tokopedia', connected: true, apiKey: 'tkp_•••• •••• 77c1', lastSync: now - 11 * 60000 },
+    { id: 'tiktok', connected: false, apiKey: '', lastSync: null },
+    { id: 'lazada', connected: false, apiKey: '', lastSync: null },
+  ];
+
+  /* Riwayat pesanan 7 hari ke belakang agar grafik langsung hidup */
+  const orders = [];
+  for (let d = 6; d >= 0; d--) {
+    const count = 2 + Math.floor(Math.random() * 4);
+    for (let i = 0; i < count; i++) {
+      const p = products[Math.floor(Math.random() * products.length)];
+      const mp = MP[Math.floor(Math.random() * MP.length)].id;
+      const qty = 1 + Math.floor(Math.random() * 2);
+      const ts = now - d * 86400000 - Math.floor(Math.random() * 14) * 3600000 - Math.floor(Math.random() * 60) * 60000;
+      orders.push({
+        id: uid('ord'),
+        code: 'INV/' + new Date(ts).toISOString().slice(0, 10).replace(/-/g, '') + '/' + (1000 + Math.floor(Math.random() * 9000)),
+        productId: p.id, productName: p.name, marketplace: mp, qty,
+        total: qty * p.prices[mp], buyer: randomBuyer(),
+        status: d === 0 ? (Math.random() < 0.45 ? 'perlu_dikirim' : 'dikirim') : 'dikirim',
+        createdAt: ts,
+      });
+    }
+  }
+  orders.sort((a, b) => b.createdAt - a.createdAt);
+
+  const syncLogs = [
+    { id: uid('log'), productName: 'Keripik Singkong Balado 250g', source: 'shopee', status: 'success', message: 'Keripik Singkong Balado 250g — Shopee laku 2 → stok Tokopedia, TikTok Shop & Lazada auto jadi 118', createdAt: now - 4 * 60000 },
+    { id: uid('log'), productName: 'Kaos Polos Hitam Cotton Combed 30s', source: 'tokopedia', status: 'success', message: 'Kaos Polos Hitam Cotton Combed 30s — Tokopedia laku 1 → stok Shopee auto jadi 47', createdAt: now - 11 * 60000 },
+    { id: uid('log'), productName: 'Batik Tulis Klaten Motif Parang', source: 'tiktok', status: 'warning', message: 'PERINGATAN: stok Batik Tulis Klaten Motif Parang menipis (sisa 15) — pertimbangkan restock', createdAt: now - 42 * 60000 },
+    { id: uid('log'), productName: 'Sambal Pecel Khas Madiun 200g', source: 'shopee', status: 'success', message: 'Sambal Pecel Khas Madiun 200g — Shopee laku 3 → stok Tokopedia, TikTok Shop & Lazada auto jadi 82', createdAt: now - 2 * 3600000 },
+    { id: uid('log'), productName: 'Sepatu Sneakers Kanvas Putih', source: 'tokopedia', status: 'failed', message: 'GAGAL: Sepatu Sneakers Kanvas Putih laku 5 di Tokopedia — stok tidak cukup (sisa 27, buffer 2)', createdAt: now - 5 * 3600000 },
+  ];
+
+  return {
+    products, marketplaces, orders, syncLogs,
+    settings: { preventOverselling: true, syncPrice: false, buffer: 2, storeName: 'Toko Berkah Klaten' },
+    users: [], user: null,
+  };
+}
+
+/* ===================== INISIALISASI STORE ===================== */
+const persisted = loadPersisted();
+const seed = buildSeed();
+const store = createStore({
+  products: persisted?.products?.length ? persisted.products : seed.products,
+  marketplaces: persisted?.marketplaces?.length ? persisted.marketplaces : seed.marketplaces,
+  orders: persisted?.orders || seed.orders,
+  syncLogs: persisted?.syncLogs || seed.syncLogs,
+  settings: Object.assign({}, seed.settings, persisted?.settings || {}),
+  users: persisted?.users || [],
+  user: persisted?.user || null,
+  /* UI state (tidak dipersist): */
+  view: 'landing',          // landing | app
+  page: 'dashboard',        // dashboard | produk | pesanan | toko | log | pengaturan
+  authOpen: false, authTab: 'register',
+  toasts: [], sidebarOpen: false, booted: false, now: Date.now(),
+});
+
+/* Jam realtime: refresh label "x detik lalu" tiap 10 detik */
+setInterval(() => store.setState({ now: Date.now() }), 10000);
+
+/* ===================== TOAST & LOG ===================== */
+function toast(msg, type = 'success') {
+  const id = uid('tst');
+  const cur = store.getState().toasts;
+  store.setState({ toasts: [...cur.slice(-2), { id, msg, type }] });
+  setTimeout(() => store.setState((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })), 3400);
+}
+function addLog(entry) {
+  const log = Object.assign({ id: uid('log'), createdAt: Date.now() }, entry);
+  store.setState((s) => ({ syncLogs: [log, ...s.syncLogs].slice(0, 120) }));
+  return log;
+}
+
+/* ================================================================
+   FASE 2 — MESIN SINKRONISASI INTI
+   handleOrder(productId, marketplaceSource, qty)
+
+   Alur:
+   1. Kunci per-produk (orderLocks) → 2 klik bersamaan pada produk yang
+      sama tidak bisa balapan; yang kedua menunggu/antre dengan aman.
+   2. Simulasi latency API 500ms agar terasa realtime.
+   3. Baca state TERBARU di dalam fungsi (bukan dari closure) → data
+      selalu fresh walau banyak order masuk berurutan.
+   4. Validasi: stok master cukup? (memperhitungkan buffer bila
+      "Cegah overselling" aktif). Tidak cukup → tolak + log GAGAL.
+   5. Kurangi Stok Master, lalu push nilai baru ke SEMUA marketplace
+      yang terhubung dalam SATU setState atomik.
+   6. Catat order + log SUKSES, tampilkan toast.
+   Karena JS single-threaded dan update dilakukan atomik via setState,
+   tidak ada kondisi balapan (race condition) yang bisa merusak stok.
+   ================================================================ */
+const orderLocks = new Set();
+
+function sellableOf(product, settings) {
+  if (!settings.preventOverselling) return product.masterStock;
+  return Math.max(0, product.masterStock - settings.buffer);
+}
+
+async function handleOrder(productId, source, qty = 1, buyerName) {
+  /* 0. Guard anti race-condition */
+  if (orderLocks.has(productId)) {
+    toast('Produk ini sedang diproses, coba sesaat lagi…', 'warning');
+    return { ok: false, reason: 'locked' };
+  }
+  orderLocks.add(productId);
+  try {
+    await delay(500); /* simulasi latency API marketplace */
+
+    const s = store.getState(); /* state fresh, bukan closure basi */
+    const p = s.products.find((x) => x.id === productId);
+    if (!p) { toast('Produk tidak ditemukan.', 'error'); return { ok: false, reason: 'not-found' }; }
+
+    const mpName = mpById(source).name;
+    const sellable = sellableOf(p, s.settings);
+    qty = Math.max(1, Math.floor(qty || 1));
+
+    /* 1–2. Validasi stok */
+    if (p.masterStock < qty || sellable < qty) {
+      addLog({
+        productName: p.name, source, status: 'failed',
+        message: 'GAGAL: ' + p.name + ' laku ' + qty + ' di ' + mpName + ' — stok tidak cukup (sisa ' + p.masterStock + (s.settings.preventOverselling ? ', buffer ' + s.settings.buffer : '') + '). Pesanan ditolak.',
+      });
+      toast('Stok ' + p.name + ' tidak cukup. Pesanan dari ' + mpName + ' ditolak.', 'error');
+      return { ok: false, reason: 'insufficient' };
+    }
+
+    /* 3. Kurangi stok master */
+    const newMaster = p.masterStock - qty;
+
+    /* 4. Sync ke semua marketplace yang terhubung (atomik, 1x setState) */
+    const connectedIds = s.marketplaces.filter((m) => m.connected).map((m) => m.id);
+    const newStocks = Object.assign({}, p.stocks);
+    const pushedValue = sellableOf(Object.assign({}, p, { masterStock: newMaster }), s.settings);
+    connectedIds.forEach((mid) => { newStocks[mid] = pushedValue; });
+    /* Jika stok master 0 → semua marketplace ikut 0 (habis). */
+
+    const price = p.prices[source] != null ? p.prices[source] : p.prices.shopee;
+    const order = {
+      id: uid('ord'),
+      code: 'INV/' + new Date().toISOString().slice(0, 10).replace(/-/g, '') + '/' + (1000 + Math.floor(Math.random() * 9000)),
+      productId, productName: p.name, marketplace: source, qty,
+      total: qty * price, buyer: buyerName || randomBuyer(),
+      status: 'perlu_dikirim', createdAt: Date.now(),
+    };
+
+    /* 5. Log sukses dengan format realtime */
+    const others = connectedIds.filter((id) => id !== source).map((id) => mpById(id).name);
+    addLog({
+      productName: p.name, source, status: 'success',
+      message: p.name + ' — ' + mpName + ' laku ' + qty + ' → stok ' + (others.length ? others.join(' & ') + ' auto jadi ' + fmtNum(pushedValue) : 'tersinkron') + ' (master ' + p.masterStock + '→' + newMaster + ')',
+    });
+
+    store.setState((st) => ({
+      products: st.products.map((x) => x.id === productId ? Object.assign({}, x, { masterStock: newMaster, stocks: newStocks }) : x),
+      orders: [order, ...st.orders],
+      marketplaces: st.marketplaces.map((m) => m.id === source ? Object.assign({}, m, { lastSync: Date.now() }) : m),
+    }));
+
+    /* 6. Toast sukses */
+    toast('Pesanan ' + order.code + ' masuk. ' + (connectedIds.length ? 'Stok tersinkron ke ' + connectedIds.length + ' toko.' : 'Belum ada toko terhubung — hubungkan tokomu dulu.'), connectedIds.length ? 'success' : 'warning');
+    return { ok: true, order };
+  } finally {
+    orderLocks.delete(productId); /* selalu buka kunci */
+  }
+}
+
+/* Buat 1 pesanan dummy acak dari produk yang stoknya masih bisa dijual */
+async function createDummyOrder() {
+  const s = store.getState();
+  const eligible = s.products.filter((p) => sellableOf(p, s.settings) > 0);
+  if (!eligible.length) { toast('Semua produk habis / terkunci buffer. Tambah stok dulu.', 'warning'); return; }
+  const p = eligible[Math.floor(Math.random() * eligible.length)];
+  const connected = s.marketplaces.filter((m) => m.connected);
+  const pool = connected.length ? connected : s.marketplaces;
+  const mp = pool[Math.floor(Math.random() * pool.length)].id;
+  const maxQ = Math.min(3, sellableOf(p, s.settings));
+  const qty = 1 + Math.floor(Math.random() * maxQ);
+  await handleOrder(p.id, mp, qty);
+}
+
+/* ===================== KOMPONEN UI BERSAMA ===================== */
+const Icon = ({ name, className }) => <i data-lucide={name} className={className || 'w-5 h-5'}></i>;
+
+/* Segarkan ikon Lucide setiap render (mengganti <i data-lucide> jadi SVG) */
+function IconRefresher() {
+  useEffect(() => {
+    if (window.lucide) { try { window.lucide.createIcons(); } catch (e) {} }
+  });
+  return null;
+}
+
+function Modal({ open, onClose, title, subtitle, children, wide }) {
+  useEffect(() => {
+    if (!open) return;
+    const h = (e) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', h);
+    return () => window.removeEventListener('keydown', h);
+  }, [open]);
+  if (!open) return null;
+  return (
+    <div className="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4" role="dialog" aria-modal="true">
+      <div className="absolute inset-0 bg-slate-900/55 backdrop-blur-[2px]" onClick={onClose}></div>
+      <div className={'anim-pop relative w-full bg-white rounded-t-3xl sm:rounded-2xl shadow-2xl max-h-[92vh] overflow-y-auto ' + (wide ? 'sm:max-w-2xl' : 'sm:max-w-md')}>
+        <div className="sticky top-0 bg-white/95 backdrop-blur px-5 sm:px-6 pt-5 pb-4 border-b border-slate-100 flex items-start justify-between gap-4 rounded-t-3xl sm:rounded-t-2xl">
+          <div>
+            <h3 className="text-lg font-bold text-slate-900">{title}</h3>
+            {subtitle && <p className="text-sm text-slate-500 mt-0.5">{subtitle}</p>}
+          </div>
+          <button onClick={onClose} className="p-2 -m-1 rounded-full hover:bg-slate-100 text-slate-400" aria-label="Tutup">
+            <Icon name="x" className="w-5 h-5" />
+          </button>
+        </div>
+        <div className="px-5 sm:px-6 py-5">{children}</div>
+      </div>
+    </div>
+  );
+}
+
+function Toasts() {
+  const toasts = useStore((s) => s.toasts);
+  const styles = {
+    success: { bar: 'bg-emerald-500', icon: 'circle-check', iconColor: 'text-emerald-600', bg: 'bg-emerald-50', border: 'border-emerald-200' },
+    error:   { bar: 'bg-rose-500',    icon: 'circle-alert', iconColor: 'text-rose-600',    bg: 'bg-rose-50',    border: 'border-rose-200' },
+    warning: { bar: 'bg-amber-500',   icon: 'triangle-alert', iconColor: 'text-amber-600', bg: 'bg-amber-50',   border: 'border-amber-200' },
+    info:    { bar: 'bg-sky-500',     icon: 'info', iconColor: 'text-sky-600',             bg: 'bg-sky-50',     border: 'border-sky-200' },
+  };
+  return (
+    <div className="fixed z-[60] bottom-20 sm:bottom-6 right-4 left-4 sm:left-auto flex flex-col gap-2 sm:w-96 pointer-events-none">
+      {toasts.map((t) => {
+        const st = styles[t.type] || styles.info;
+        return (
+          <div key={t.id} className={'anim-toast pointer-events-auto flex items-start gap-3 rounded-xl border bg-white shadow-lg p-3.5 ' + st.border}>
+            <span className={'w-1 self-stretch rounded-full ' + st.bar}></span>
+            <Icon name={st.icon} className={'w-5 h-5 mt-0.5 shrink-0 ' + st.iconColor} />
+            <p className="text-sm text-slate-700 leading-snug">{t.msg}</p>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* Badge marketplace: lingkaran huruf + nama */
+function MpBadge({ id, size }) {
+  const m = mpById(id);
+  const sz = size === 'sm' ? 'w-5 h-5 text-[10px]' : 'w-6 h-6 text-[11px]';
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <span className={'inline-flex items-center justify-center rounded-full font-bold text-white shrink-0 ' + sz} style={{ background: m.color }}>{m.letter}</span>
+      <span className="text-xs font-medium text-slate-600">{m.name}</span>
+    </span>
+  );
+}
+
+function StatusBadge({ status }) {
+  const map = {
+    success: ['SUKSES', 'bg-emerald-100 text-emerald-700'],
+    failed: ['GAGAL', 'bg-rose-100 text-rose-700'],
+    warning: ['PERINGATAN', 'bg-amber-100 text-amber-700'],
+    info: ['INFO', 'bg-sky-100 text-sky-700'],
+    perlu_dikirim: ['PERLU DIKIRIM', 'bg-amber-100 text-amber-700'],
+    dikirim: ['DIKIRIM', 'bg-emerald-100 text-emerald-700'],
+    dibatalkan: ['DIBATALKAN', 'bg-slate-200 text-slate-600'],
+  };
+  const [label, cls] = map[status] || map.info;
+  return <span className={'inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-bold tracking-wide ' + cls}>{label}</span>;
+}
+
+function Switch({ checked, onChange }) {
+  return (
+    <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)}
+      className={'relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors ' + (checked ? 'bg-brand-600' : 'bg-slate-300')}>
+      <span className={'inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ' + (checked ? 'translate-x-6' : 'translate-x-1')} />
+    </button>
+  );
+}
+
+function EmptyState({ icon, title, desc, action }) {
+  return (
+    <div className="anim-fade-up flex flex-col items-center justify-center text-center py-14 px-6 bg-white rounded-2xl border border-dashed border-slate-200">
+      <div className="w-14 h-14 rounded-2xl bg-brand-50 flex items-center justify-center mb-4">
+        <Icon name={icon} className="w-7 h-7 text-brand-600" />
+      </div>
+      <h4 className="font-bold text-slate-900">{title}</h4>
+      <p className="text-sm text-slate-500 mt-1 max-w-xs">{desc}</p>
+      {action && <div className="mt-4">{action}</div>}
+    </div>
+  );
+}
+
+function Field({ label, children, hint }) {
+  return (
+    <label className="block">
+      <span className="text-sm font-semibold text-slate-700">{label}</span>
+      <div className="mt-1.5">{children}</div>
+      {hint && <span className="text-xs text-slate-400 mt-1 block">{hint}</span>}
+    </label>
+  );
+}
+const inputCls = 'w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-brand-500';
+
+/* ===================== LANDING PAGE ===================== */
+function Landing() {
+  const openAuth = (tab) => store.setState({ authOpen: true, authTab: tab || 'register' });
+  const demo = () => {
+    store.setState({ user: { name: 'Demo UMKM', email: 'demo@stoksync.id', storeName: 'Toko Berkah Klaten', demo: true }, view: 'app', page: 'dashboard' });
+    toast('Selamat datang di demo StokSync! Coba tombol "Simulasi Pesanan".', 'info');
+  };
+  const scrollTo = (id) => { const el = document.getElementById(id); if (el) el.scrollIntoView({ behavior: 'smooth' }); };
+
+  const features = [
+    ['refresh-cw', 'Sync Stok Realtime', 'Pesanan masuk di satu marketplace → stok di semua toko terupdate otomatis dalam hitungan detik.'],
+    ['triangle-alert', 'Anti Overselling', 'Proteksi buffer stok & validasi sebelum order. Stok habis di satu toko = habis di semua toko.'],
+    ['banknote', 'Sync Harga Massal', 'Naikkan/turunkan harga per marketplace sekaligus. Misal +10% khusus TikTok Shop.'],
+    ['activity', 'Analitik 7 Hari', 'Grafik penjualan gabungan semua marketplace + laporan CSV siap unduh.'],
+    ['history', 'Log Sync Transparan', 'Setiap perubahan stok tercatat: produk apa, dari toko mana, kapan, dan statusnya.'],
+    ['shield-check', 'Siap Production', 'Arsitektur siap migrasi ke Supabase & OAuth resmi marketplace. Mulai dari simulasi, scale tanpa rewrite.'],
+  ];
+  const steps = [
+    ['1', 'Hubungkan Tokomu', 'Masukkan API key tiap marketplace. Mode simulasi aktif — untuk production tinggal ganti ke OAuth resmi.'],
+    ['2', 'Tambah Produk', 'Input SKU, stok master gudang, dan harga per marketplace. Bisa import CSV sekaligus.'],
+    ['3', 'Biarkan StokSync Bekerja', 'Setiap ada pesanan, stok master & semua toko tersinkron otomatis. Kamu fokus jualan.'],
+  ];
+
+  return (
+    <div className="min-h-screen bg-white text-slate-900">
+      {/* NAVBAR */}
+      <header className="sticky top-0 z-40 bg-white/85 backdrop-blur border-b border-slate-100">
+        <div className="max-w-6xl mx-auto px-4 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-brand-500 to-violet-700 flex items-center justify-center shadow-md">
+              <Icon name="refresh-cw" className="w-5 h-5 text-white" />
+            </div>
+            <span className="font-extrabold text-lg tracking-tight">Stok<span className="text-brand-600">Sync</span></span>
+          </div>
+          <nav className="hidden md:flex items-center gap-7 text-sm font-medium text-slate-600">
+            <button onClick={() => scrollTo('fitur')} className="hover:text-brand-600">Fitur</button>
+            <button onClick={() => scrollTo('cara')} className="hover:text-brand-600">Cara Kerja</button>
+            <button onClick={() => scrollTo('harga')} className="hover:text-brand-600">Harga</button>
+          </nav>
+          <div className="flex items-center gap-2">
+            <button onClick={() => openAuth('login')} className="px-4 py-2 text-sm font-semibold text-slate-700 hover:text-brand-600">Masuk</button>
+            <button onClick={() => openAuth('register')} className="px-4 py-2 text-sm font-semibold text-white bg-brand-600 hover:bg-brand-700 rounded-xl shadow-sm">Mulai Gratis</button>
+          </div>
+        </div>
+      </header>
+
+      {/* HERO */}
+      <section className="relative overflow-hidden">
+        <div className="absolute inset-0 bg-gradient-to-b from-brand-50 via-white to-white pointer-events-none"></div>
+        <div className="relative max-w-6xl mx-auto px-4 pt-14 pb-12 md:pt-20 md:pb-16 text-center">
+          <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-brand-50 border border-brand-100 text-xs font-semibold text-brand-700 mb-6">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 pulse-dot"></span>
+            Dibuat untuk UMKM Indonesia
+          </div>
+          <h1 className="text-3xl md:text-5xl font-extrabold tracking-tight leading-tight max-w-3xl mx-auto">
+            Stop Overselling. Sync Stok <span className="text-brand-600">Shopee</span>, <span className="text-brand-600">Tokopedia</span>, <span className="text-brand-600">TikTok</span> dalam 1 Klik
+          </h1>
+          <p className="mt-5 text-slate-600 text-base md:text-lg max-w-2xl mx-auto">
+            Satu dashboard untuk mengatur stok & harga di semua tokomu. Laku di Shopee → stok Tokopedia & TikTok Shop berkurang otomatis. Tidak ada lagi penalti marketplace.
+          </p>
+          <div className="mt-8 flex flex-col sm:flex-row items-center justify-center gap-3">
+            <button onClick={() => openAuth('register')} className="w-full sm:w-auto px-7 py-3.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-lg shadow-brand-600/25 flex items-center justify-center gap-2">
+              Mulai Gratis Sekarang <Icon name="arrow-right" className="w-4 h-4" />
+            </button>
+            <button onClick={demo} className="w-full sm:w-auto px-7 py-3.5 rounded-xl bg-white border-2 border-slate-200 hover:border-brand-600 hover:text-brand-700 font-bold text-slate-700 flex items-center justify-center gap-2">
+              <Icon name="zap" className="w-4 h-4" /> Lihat Demo Langsung
+            </button>
+          </div>
+          <p className="mt-4 text-xs text-slate-400">Gratis 20 produk • Tanpa kartu kredit • 2 menit setup</p>
+
+          {/* Mockup preview */}
+          <div className="mt-12 max-w-4xl mx-auto">
+            <div className="rounded-2xl border border-slate-200 shadow-2xl shadow-slate-200 overflow-hidden bg-white text-left">
+              <div className="flex items-center gap-1.5 px-4 py-3 bg-slate-50 border-b border-slate-100">
+                <span className="w-3 h-3 rounded-full bg-rose-400"></span><span className="w-3 h-3 rounded-full bg-amber-400"></span><span className="w-3 h-3 rounded-full bg-emerald-400"></span>
+                <span className="ml-3 text-xs text-slate-400 font-mono">app.stoksync.id/dashboard</span>
+              </div>
+              <div className="p-4 md:p-6 grid grid-cols-2 md:grid-cols-4 gap-3">
+                {[['package', '248', 'Total Produk'], ['shopping-cart', '32', 'Pesanan Hari Ini'], ['truck', '14', 'Perlu Dikirim'], ['triangle-alert', '3', 'Stok Menipis']].map((c, i) => (
+                  <div key={i} className="rounded-xl border border-slate-100 bg-slate-50/60 p-3.5">
+                    <Icon name={c[0]} className="w-5 h-5 text-brand-600 mb-2" />
+                    <div className="text-xl font-extrabold">{c[1]}</div>
+                    <div className="text-xs text-slate-500">{c[2]}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="px-4 md:px-6 pb-5">
+                <div className="rounded-xl bg-slate-900 text-emerald-300 font-mono text-[11px] md:text-xs p-4 leading-relaxed">
+                  <div><span className="text-slate-500">14:02:11</span> Kaos Polos Hitam — Shopee laku 1 → stok Tokopedia & TikTok auto jadi 47 <span className="text-emerald-400 font-bold">[SUKSES]</span></div>
+                  <div><span className="text-slate-500">13:58:03</span> Keripik Singkong Balado — Tokopedia laku 2 → stok Shopee & Lazada auto jadi 118 <span className="text-emerald-400 font-bold">[SUKSES]</span></div>
+                  <div className="text-slate-500">▊ sinkronisasi realtime aktif…</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* FITUR */}
+      <section id="fitur" className="py-14 md:py-20 bg-slate-50/60">
+        <div className="max-w-6xl mx-auto px-4">
+          <h2 className="text-2xl md:text-3xl font-extrabold text-center tracking-tight">Semua yang UMKM butuhkan, <span className="text-brand-600">tanpa ribet</span></h2>
+          <p className="text-center text-slate-500 mt-3 max-w-xl mx-auto">Fokus jualan, biar StokSync yang urus sinkronisasi stok & harga lintas marketplace.</p>
+          <div className="mt-10 grid sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {features.map((f, i) => (
+              <div key={i} className="bg-white rounded-2xl border border-slate-100 p-6 shadow-sm hover:shadow-md transition-shadow">
+                <div className="w-11 h-11 rounded-xl bg-brand-50 flex items-center justify-center mb-4"><Icon name={f[0]} className="w-5 h-5 text-brand-600" /></div>
+                <h3 className="font-bold">{f[1]}</h3>
+                <p className="text-sm text-slate-500 mt-1.5 leading-relaxed">{f[2]}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* CARA KERJA */}
+      <section id="cara" className="py-14 md:py-20">
+        <div className="max-w-6xl mx-auto px-4">
+          <h2 className="text-2xl md:text-3xl font-extrabold text-center tracking-tight">Mulai dalam <span className="text-brand-600">3 langkah</span></h2>
+          <div className="mt-10 grid md:grid-cols-3 gap-4">
+            {steps.map((s, i) => (
+              <div key={i} className="relative rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
+                <div className="w-10 h-10 rounded-full bg-brand-600 text-white font-extrabold flex items-center justify-center mb-4">{s[0]}</div>
+                <h3 className="font-bold">{s[1]}</h3>
+                <p className="text-sm text-slate-500 mt-1.5 leading-relaxed">{s[2]}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* HARGA */}
+      <section id="harga" className="py-14 md:py-20 bg-slate-900 text-white">
+        <div className="max-w-5xl mx-auto px-4">
+          <h2 className="text-2xl md:text-3xl font-extrabold text-center tracking-tight">Harga jujur untuk <span className="text-brand-500">UMKM</span></h2>
+          <p className="text-center text-slate-400 mt-3">Mulai gratis. Upgrade saat tokomu meledak.</p>
+          <div className="mt-10 grid md:grid-cols-2 gap-5 max-w-3xl mx-auto">
+            <div className="rounded-2xl border border-slate-700 bg-slate-800/60 p-7">
+              <h3 className="font-bold text-lg flex items-center gap-2"><Icon name="gift" className="w-5 h-5 text-emerald-400" /> Gratis</h3>
+              <div className="mt-3 text-3xl font-extrabold">Rp0<span className="text-sm font-medium text-slate-400">/selamanya</span></div>
+              <ul className="mt-5 space-y-2.5 text-sm text-slate-300">
+                {['20 produk', '2 toko marketplace', 'Sync stok realtime', 'Log sync 7 hari'].map((x, i) => (
+                  <li key={i} className="flex items-center gap-2"><Icon name="check" className="w-4 h-4 text-emerald-400" />{x}</li>
+                ))}
+              </ul>
+              <button onClick={() => openAuth('register')} className="mt-6 w-full py-3 rounded-xl border-2 border-slate-600 font-bold hover:border-brand-500 hover:text-brand-500">Daftar Gratis</button>
+            </div>
+            <div className="rounded-2xl border-2 border-brand-500 bg-gradient-to-b from-brand-600/20 to-transparent p-7 relative">
+              <span className="absolute -top-3 left-1/2 -translate-x-1/2 px-3 py-1 rounded-full bg-brand-600 text-xs font-bold">PALING LARIS</span>
+              <h3 className="font-bold text-lg flex items-center gap-2"><Icon name="crown" className="w-5 h-5 text-amber-400" /> Pro</h3>
+              <div className="mt-3 text-3xl font-extrabold">Rp99rb<span className="text-sm font-medium text-slate-400">/bulan</span></div>
+              <ul className="mt-5 space-y-2.5 text-sm text-slate-200">
+                {['500 produk', '4 toko marketplace', 'Sync stok + harga massal', 'Buffer anti-overselling', 'Log sync tanpa batas', 'Export laporan CSV', 'Prioritas support WA'].map((x, i) => (
+                  <li key={i} className="flex items-center gap-2"><Icon name="check" className="w-4 h-4 text-brand-500" />{x}</li>
+                ))}
+              </ul>
+              <button onClick={() => openAuth('register')} className="mt-6 w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 font-bold shadow-lg shadow-brand-600/30">Coba Pro 14 Hari Gratis</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      {/* TESTIMONI */}
+      <section className="py-14 md:py-20">
+        <div className="max-w-6xl mx-auto px-4">
+          <h2 className="text-2xl md:text-3xl font-extrabold text-center tracking-tight">Dipercaya UMKM <span className="text-brand-600">Klaten & sekitarnya</span></h2>
+          <div className="mt-10 grid md:grid-cols-2 gap-4 max-w-4xl mx-auto">
+            {[
+              ['Dulu tiap ada yang laku di Shopee, saya update manual ke Tokopedia. Sering telat → kena penalti overselling 2x. Sejak pakai StokSync, nol penalti dalam 3 bulan.', 'Sari Wulandari', 'Owner Keripik Balado Mak Iroh, Klaten'],
+              ['Saya punya 4 toko dan 200 SKU batik. Fitur harga massal +10% buat TikTok ngebantu banget nutupin fee live. Dashboardnya gampang dipakai ibu-ibu kayak saya.', 'Hj. Ratna Dewi', 'Batik Arum Sari, Solo'],
+            ].map((t, i) => (
+              <div key={i} className="rounded-2xl border border-slate-100 bg-white p-6 shadow-sm">
+                <div className="flex gap-1 mb-3">{[0,1,2,3,4].map((s) => <Icon key={s} name="star" className="w-4 h-4 text-amber-400 fill-amber-400" />)}</div>
+                <p className="text-sm text-slate-600 leading-relaxed">“{t[0]}”</p>
+                <div className="mt-4 flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-full bg-gradient-to-br from-brand-500 to-violet-700 flex items-center justify-center text-white font-bold text-sm">{t[1][0]}</div>
+                  <div><div className="font-bold text-sm">{t[1]}</div><div className="text-xs text-slate-500">{t[2]}</div></div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </section>
+
+      {/* CTA + FOOTER */}
+      <section className="pb-16 px-4">
+        <div className="max-w-4xl mx-auto rounded-3xl bg-gradient-to-br from-brand-600 to-violet-700 p-8 md:p-12 text-center text-white shadow-xl">
+          <h2 className="text-2xl md:text-3xl font-extrabold tracking-tight">Berhenti update stok manual hari ini.</h2>
+          <p className="mt-3 text-brand-100">Gabung 1.200+ UMKM yang sudah bebas overselling.</p>
+          <button onClick={() => openAuth('register')} className="mt-6 px-8 py-3.5 rounded-xl bg-white text-brand-700 font-bold hover:bg-brand-50 shadow-lg">Buat Akun Gratis</button>
+        </div>
+      </section>
+      <footer className="border-t border-slate-100 py-8">
+        <div className="max-w-6xl mx-auto px-4 flex flex-col md:flex-row items-center justify-between gap-3 text-sm text-slate-400">
+          <div className="flex items-center gap-2"><Icon name="refresh-cw" className="w-4 h-4" /><span className="font-bold text-slate-600">StokSync</span> — Satu Stok Untuk Semua Toko</div>
+          <div>© 2026 StokSync • Dibuat dengan bangga di Klaten, Indonesia</div>
+        </div>
+      </footer>
+      <AuthModal />
+    </div>
+  );
+}
+
+/* ===================== AUTH (Daftar / Masuk) ===================== */
+function AuthModal() {
+  const open = useStore((s) => s.authOpen);
+  const tab = useStore((s) => s.authTab);
+  const [name, setName] = useState('');
+  const [storeName, setStoreName] = useState('');
+  const [email, setEmail] = useState('');
+  const [err, setErr] = useState('');
+  const close = () => { store.setState({ authOpen: false }); setErr(''); };
+  const setTab = (t) => { store.setState({ authTab: t }); setErr(''); };
+
+  const submit = (e) => {
+    e.preventDefault();
+    setErr('');
+    const s = store.getState();
+    if (tab === 'register') {
+      if (!name.trim() || !email.trim() || !storeName.trim()) { setErr('Lengkapi nama, nama toko, dan email dulu ya.'); return; }
+      if (s.users.some((u) => u.email.toLowerCase() === email.trim().toLowerCase())) { setErr('Email ini sudah terdaftar. Silakan masuk.'); return; }
+      const user = { name: name.trim(), storeName: storeName.trim(), email: email.trim() };
+      store.setState((st) => ({ users: [...st.users, user], user, authOpen: false, view: 'app', page: 'dashboard', settings: Object.assign({}, st.settings, { storeName: user.storeName }) }));
+      setName(''); setStoreName(''); setEmail('');
+      toast('Akun berhasil dibuat. Selamat datang, ' + user.name + '!', 'success');
+    } else {
+      const user = s.users.find((u) => u.email.toLowerCase() === email.trim().toLowerCase());
+      if (!user) { setErr('Email belum terdaftar. Daftar dulu yuk — gratis.'); return; }
+      store.setState({ user, authOpen: false, view: 'app', page: 'dashboard' });
+      setEmail('');
+      toast('Selamat datang kembali, ' + user.name + '!', 'success');
+    }
+  };
+
+  return (
+    <Modal open={open} onClose={close} title={tab === 'register' ? 'Buat akun gratis' : 'Masuk ke StokSync'} subtitle="Kelola semua tokomu dari satu dashboard.">
+      <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-xl mb-5">
+        {['register', 'login'].map((t) => (
+          <button key={t} onClick={() => setTab(t)} className={'py-2 rounded-lg text-sm font-bold transition ' + (tab === t ? 'bg-white shadow text-slate-900' : 'text-slate-500 hover:text-slate-700')}>
+            {t === 'register' ? 'Daftar' : 'Masuk'}
+          </button>
+        ))}
+      </div>
+      <form onSubmit={submit} className="space-y-4">
+        {tab === 'register' && (
+          <React.Fragment>
+            <Field label="Nama kamu"><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} placeholder="cth: Sari Wulandari" /></Field>
+            <Field label="Nama toko / usaha"><input className={inputCls} value={storeName} onChange={(e) => setStoreName(e.target.value)} placeholder="cth: Keripik Balado Mak Iroh" /></Field>
+          </React.Fragment>
+        )}
+        <Field label="Email"><input type="email" className={inputCls} value={email} onChange={(e) => setEmail(e.target.value)} placeholder="kamu@tokomu.id" /></Field>
+        {err && <div className="flex items-start gap-2 text-sm text-rose-600 bg-rose-50 border border-rose-200 rounded-xl px-3.5 py-2.5"><Icon name="circle-alert" className="w-4 h-4 mt-0.5 shrink-0" />{err}</div>}
+        <button type="submit" className="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-md">
+          {tab === 'register' ? 'Buat Akun & Mulai' : 'Masuk Dashboard'}
+        </button>
+        <p className="text-[11px] text-slate-400 text-center">Mode demo: data tersimpan lokal di browser ini (localStorage).</p>
+      </form>
+    </Modal>
+  );
+}
+
+/* ===================== NAVIGASI ===================== */
+const NAV = [
+  { id: 'dashboard', label: 'Dashboard', icon: 'layout-dashboard' },
+  { id: 'produk', label: 'Produk', icon: 'package' },
+  { id: 'pesanan', label: 'Pesanan', icon: 'shopping-cart' },
+  { id: 'toko', label: 'Toko Terhubung', icon: 'store' },
+  { id: 'log', label: 'Log Sync', icon: 'history' },
+  { id: 'pengaturan', label: 'Pengaturan', icon: 'settings' },
+];
+const PAGE_META = {
+  dashboard: ['Dashboard', 'Ringkasan semua tokomu hari ini'],
+  produk: ['Produk', 'Kelola SKU, stok master & harga per marketplace'],
+  pesanan: ['Pesanan', 'Pesanan masuk dari semua marketplace'],
+  toko: ['Toko Terhubung', 'Hubungkan Shopee, Tokopedia, TikTok Shop & Lazada'],
+  log: ['Log Sync', 'Jejak audit setiap sinkronisasi stok'],
+  pengaturan: ['Pengaturan', 'Aturan sync & profil tokomu'],
+};
+const go = (page) => store.setState({ view: 'app', page, sidebarOpen: false });
+const logout = () => { store.setState({ user: null, view: 'landing', page: 'dashboard' }); toast('Kamu sudah keluar. Sampai jumpa!', 'info'); };
+
+function SyncPill() {
+  const mps = useStore((s) => s.marketplaces);
+  const n = mps.filter((m) => m.connected).length;
+  return (
+    <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-emerald-50 border border-emerald-200 text-xs font-bold text-emerald-700">
+      <span className="w-2 h-2 rounded-full bg-emerald-500 pulse-dot"></span>
+      Sync Aktif • {n} toko
+    </span>
+  );
+}
+
+function Bell() {
+  const [open, setOpen] = useState(false);
+  const logs = useStore((s) => s.syncLogs);
+  const now = useStore((s) => s.now);
+  const unread = logs.filter((l) => l.status === 'failed').length;
+  return (
+    <div className="relative">
+      <button onClick={() => setOpen(!open)} className="relative p-2.5 rounded-xl hover:bg-slate-100 text-slate-500" aria-label="Notifikasi">
+        <Icon name="bell" className="w-5 h-5" />
+        {unread > 0 && <span className="absolute top-1.5 right-1.5 min-w-[18px] h-[18px] px-1 rounded-full bg-rose-500 text-white text-[10px] font-bold flex items-center justify-center">{unread}</span>}
+      </button>
+      {open && (
+        <React.Fragment>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)}></div>
+          <div className="anim-pop absolute right-0 top-12 z-50 w-80 max-w-[85vw] bg-white rounded-2xl shadow-2xl border border-slate-100 overflow-hidden">
+            <div className="px-4 py-3 border-b border-slate-100 font-bold text-sm">Aktivitas Terakhir</div>
+            <div className="max-h-80 overflow-y-auto divide-y divide-slate-50">
+              {logs.slice(0, 6).map((l) => (
+                <div key={l.id} className="px-4 py-3 flex gap-3">
+                  <span className={'mt-1 w-2 h-2 rounded-full shrink-0 ' + (l.status === 'success' ? 'bg-emerald-500' : l.status === 'failed' ? 'bg-rose-500' : 'bg-amber-500')}></span>
+                  <div><p className="text-xs text-slate-700 leading-snug">{l.message}</p><p className="text-[11px] text-slate-400 mt-1">{timeAgo(l.createdAt, now)}</p></div>
+                </div>
+              ))}
+              {!logs.length && <p className="p-4 text-sm text-slate-400 text-center">Belum ada aktivitas.</p>}
+            </div>
+            <button onClick={() => { setOpen(false); go('log'); }} className="w-full py-2.5 text-sm font-bold text-brand-600 hover:bg-brand-50">Lihat Semua Log</button>
+          </div>
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
+function UserChip() {
+  const user = useStore((s) => s.user);
+  const initial = (user?.name || 'U').trim()[0].toUpperCase();
+  return (
+    <div className="flex items-center gap-2.5">
+      <div className="w-9 h-9 rounded-full bg-gradient-to-br from-brand-500 to-violet-700 flex items-center justify-center text-white font-bold text-sm shadow">{initial}</div>
+      <div className="hidden sm:block leading-tight">
+        <div className="text-sm font-bold text-slate-900 max-w-[120px] truncate">{user?.name || 'Pengguna'}</div>
+        <div className="text-[11px] text-slate-400 max-w-[120px] truncate">{user?.storeName || ''}</div>
+      </div>
+    </div>
+  );
+}
+
+/* ===================== SHELL (layout utama) ===================== */
+function Shell() {
+  const page = useStore((s) => s.page);
+  const [title, subtitle] = PAGE_META[page] || PAGE_META.dashboard;
+  const [menuOpen, setMenuOpen] = useState(false);
+  const user = useStore((s) => s.user);
+
+  const Page = { dashboard: DashboardPage, produk: ProductsPage, pesanan: OrdersPage, toko: StoresPage, log: LogsPage, pengaturan: SettingsPage }[page] || DashboardPage;
+
+  return (
+    <div className="min-h-screen bg-[#f6f7fb]">
+      {/* ===== Sidebar desktop ===== */}
+      <aside className="hidden lg:flex fixed inset-y-0 left-0 w-64 flex-col bg-white border-r border-slate-100 z-30">
+        <div className="h-16 flex items-center gap-2.5 px-5 border-b border-slate-100">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-brand-500 to-violet-700 flex items-center justify-center shadow-md"><Icon name="refresh-cw" className="w-5 h-5 text-white" /></div>
+          <span className="font-extrabold text-lg tracking-tight">Stok<span className="text-brand-600">Sync</span></span>
+        </div>
+        <nav className="flex-1 p-3 space-y-1 overflow-y-auto">
+          {NAV.map((n) => (
+            <button key={n.id} onClick={() => go(n.id)}
+              className={'w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-semibold transition ' + (page === n.id ? 'bg-brand-600 text-white shadow-md shadow-brand-600/25' : 'text-slate-600 hover:bg-slate-100')}>
+              <Icon name={n.icon} className="w-5 h-5" />{n.label}
+            </button>
+          ))}
+        </nav>
+        <div className="p-4 border-t border-slate-100">
+          <div className="flex items-center justify-between gap-2">
+            <UserChip />
+            <button onClick={logout} title="Keluar" className="p-2 rounded-xl text-slate-400 hover:text-rose-600 hover:bg-rose-50"><Icon name="log-out" className="w-5 h-5" /></button>
+          </div>
+        </div>
+      </aside>
+
+      {/* ===== Konten ===== */}
+      <div className="lg:pl-64 pb-24 lg:pb-10">
+        {/* Header */}
+        <header className="sticky top-0 z-20 bg-white/85 backdrop-blur border-b border-slate-100">
+          <div className="px-4 sm:px-6 h-16 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3 min-w-0">
+              <div className="lg:hidden w-9 h-9 rounded-xl bg-gradient-to-br from-brand-500 to-violet-700 flex items-center justify-center shrink-0"><Icon name="refresh-cw" className="w-5 h-5 text-white" /></div>
+              <div className="min-w-0">
+                <h1 className="font-extrabold text-slate-900 leading-tight truncate">{title}</h1>
+                <p className="text-xs text-slate-400 truncate hidden sm:block">{subtitle}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-1.5 sm:gap-3">
+              <div className="hidden md:block"><SyncPill /></div>
+              <Bell />
+              <div className="hidden sm:block"><UserChip /></div>
+            </div>
+          </div>
+        </header>
+
+        <main className="px-4 sm:px-6 py-5 max-w-7xl mx-auto anim-fade-up" key={page}>
+          <Page />
+        </main>
+      </div>
+
+      {/* ===== Bottom nav mobile ===== */}
+      <nav className="lg:hidden fixed bottom-0 inset-x-0 z-30 bg-white border-t border-slate-200 px-2 pt-1.5" style={{ paddingBottom: 'max(0.4rem, env(safe-area-inset-bottom))' }}>
+        <div className="grid grid-cols-5 gap-1">
+          {[
+            { id: 'dashboard', label: 'Home', icon: 'layout-dashboard' },
+            { id: 'produk', label: 'Produk', icon: 'package' },
+            { id: 'pesanan', label: 'Pesanan', icon: 'shopping-cart' },
+            { id: 'toko', label: 'Toko', icon: 'store' },
+          ].map((n) => (
+            <button key={n.id} onClick={() => go(n.id)} className={'flex flex-col items-center gap-1 py-1.5 rounded-lg text-[10px] font-bold ' + (page === n.id ? 'text-brand-600' : 'text-slate-400')}>
+              <Icon name={n.icon} className="w-5 h-5" />{n.label}
+            </button>
+          ))}
+          <button onClick={() => setMenuOpen(true)} className={'flex flex-col items-center gap-1 py-1.5 rounded-lg text-[10px] font-bold ' + ((page === 'log' || page === 'pengaturan') ? 'text-brand-600' : 'text-slate-400')}>
+            <Icon name="menu" className="w-5 h-5" />Menu
+          </button>
+        </div>
+      </nav>
+
+      {/* Sheet "Menu" mobile */}
+      <Modal open={menuOpen} onClose={() => setMenuOpen(false)} title="Menu Lainnya">
+        <div className="space-y-2">
+          {[
+            { id: 'log', label: 'Log Sync', icon: 'history', desc: 'Jejak audit sinkronisasi' },
+            { id: 'pengaturan', label: 'Pengaturan', icon: 'settings', desc: 'Aturan sync & profil toko' },
+          ].map((n) => (
+            <button key={n.id} onClick={() => { setMenuOpen(false); go(n.id); }} className="w-full flex items-center gap-3 p-3.5 rounded-xl border border-slate-100 hover:border-brand-300 hover:bg-brand-50/50 text-left">
+              <span className="w-10 h-10 rounded-xl bg-brand-50 flex items-center justify-center"><Icon name={n.icon} className="w-5 h-5 text-brand-600" /></span>
+              <span><span className="block font-bold text-sm">{n.label}</span><span className="block text-xs text-slate-400">{n.desc}</span></span>
+              <Icon name="chevron-right" className="w-4 h-4 ml-auto text-slate-300" />
+            </button>
+          ))}
+          <div className="pt-2 border-t border-slate-100 mt-3">
+            <div className="flex items-center justify-between py-2">
+              <UserChip />
+              <button onClick={logout} className="flex items-center gap-2 px-3 py-2 rounded-xl text-sm font-bold text-rose-600 bg-rose-50"><Icon name="log-out" className="w-4 h-4" />Keluar</button>
+            </div>
+          </div>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+function Splash() {
+  return (
+    <div className="min-h-screen bg-white flex flex-col items-center justify-center gap-6 px-6">
+      <div className="w-16 h-16 rounded-3xl bg-gradient-to-br from-brand-500 to-violet-700 flex items-center justify-center shadow-xl">
+        <Icon name="refresh-cw" className="w-8 h-8 text-white spin" />
+      </div>
+      <div className="text-center">
+        <div className="font-extrabold text-xl">Stok<span className="text-brand-600">Sync</span></div>
+        <p className="text-sm text-slate-400 mt-1">Menyiapkan dashboard tokomu…</p>
+      </div>
+      <div className="w-64 space-y-2.5">
+        <div className="skeleton h-14 rounded-xl"></div>
+        <div className="skeleton h-14 rounded-xl"></div>
+        <div className="skeleton h-14 rounded-xl"></div>
+      </div>
+    </div>
+  );
+}
+
+/* ===================== GRAFIK PENJUALAN (SVG custom) ===================== */
+function SalesChart({ data }) {
+  const [hover, setHover] = useState(null);
+  const max = Math.max.apply(null, data.map((d) => d.value).concat([1]));
+  const n = data.length;
+  const pts = data.map((d, i) => ({
+    x: n === 1 ? 50 : (i / (n - 1)) * 100,
+    y: 92 - (d.value / max) * 78,
+    label: d.label, value: d.value,
+  }));
+  const line = pts.map((p, i) => (i ? 'L' : 'M') + p.x.toFixed(2) + ',' + p.y.toFixed(2)).join(' ');
+  const area = line + ' L' + pts[n - 1].x.toFixed(2) + ',100 L' + pts[0].x.toFixed(2) + ',100 Z';
+  return (
+    <div>
+      <div className="relative h-52 sm:h-60 select-none" onMouseLeave={() => setHover(null)}>
+        <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="absolute inset-0 w-full h-full">
+          <defs>
+            <linearGradient id="salesGrad" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stopColor="#4f46e5" stopOpacity="0.32" />
+              <stop offset="100%" stopColor="#4f46e5" stopOpacity="0.02" />
+            </linearGradient>
+          </defs>
+          {[25, 50, 75].map((g) => <line key={g} x1="0" y1={g} x2="100" y2={g} stroke="#eef1f6" strokeWidth="1" vectorEffect="non-scaling-stroke" />)}
+          <path d={area} fill="url(#salesGrad)" />
+          <path d={line} fill="none" stroke="#4f46e5" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" vectorEffect="non-scaling-stroke" />
+        </svg>
+        {pts.map((p, i) => (
+          <button key={i} aria-label={p.label + ': ' + fmtIDR(p.value)}
+            onMouseEnter={() => setHover(i)} onClick={() => setHover(i)} onFocus={() => setHover(i)}
+            className="absolute w-7 h-7 -translate-x-1/2 -translate-y-1/2 rounded-full"
+            style={{ left: p.x + '%', top: p.y + '%' }}>
+            <span className={'absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-brand-600 bg-white shadow transition-all ' + (hover === i ? 'w-3.5 h-3.5' : 'w-2.5 h-2.5')}></span>
+          </button>
+        ))}
+        {hover != null && (
+          <div className="absolute z-10 -translate-x-1/2 pointer-events-none" style={{ left: Math.min(88, Math.max(12, pts[hover].x)) + '%', top: '0' }}>
+            <div className="whitespace-nowrap rounded-lg bg-slate-900 text-white text-xs font-semibold px-2.5 py-1.5 shadow-xl">
+              {pts[hover].label} • <span className="text-brand-500 font-bold" style={{ color: '#a5b4fc' }}>{fmtIDR(pts[hover].value)}</span>
+            </div>
+          </div>
+        )}
+      </div>
+      <div className="flex justify-between mt-2 px-0.5">
+        {data.map((d, i) => <span key={i} className={'text-[11px] font-semibold ' + (i === n - 1 ? 'text-brand-600' : 'text-slate-400')}>{d.short}</span>)}
+      </div>
+    </div>
+  );
+}
+
+/* ===================== DASHBOARD ===================== */
+function DashboardPage() {
+  const products = useStore((s) => s.products);
+  const orders = useStore((s) => s.orders);
+  const logs = useStore((s) => s.syncLogs);
+  const settings = useStore((s) => s.settings);
+  const user = useStore((s) => s.user);
+  const now = useStore((s) => s.now);
+  const [simulating, setSimulating] = useState(false);
+
+  const todayStr = dayKey(now);
+  const ordersToday = orders.filter((o) => dayKey(o.createdAt) === todayStr && o.status !== 'dibatalkan');
+  const revenueToday = ordersToday.reduce((a, o) => a + o.total, 0);
+  const needShip = orders.filter((o) => o.status === 'perlu_dikirim');
+  const lowStock = products.filter((p) => p.masterStock <= 5);
+  const failedToday = logs.filter((l) => l.status === 'failed' && dayKey(l.createdAt) === todayStr).length;
+
+  const chartData = useMemo(() => {
+    const days = [];
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now - i * 86400000);
+      days.push(d);
+    }
+    return days.map((d) => {
+      const k = dayKey(d.getTime());
+      const rev = orders.filter((o) => dayKey(o.createdAt) === k && o.status !== 'dibatalkan').reduce((a, o) => a + o.total, 0);
+      return { label: d.toLocaleDateString('id-ID', { day: 'numeric', month: 'short' }), short: d.toLocaleDateString('id-ID', { weekday: 'short' }), value: rev };
+    });
+  }, [orders, now]);
+  const weekRevenue = chartData.reduce((a, d) => a + d.value, 0);
+
+  const simulate = async () => {
+    if (simulating) return;
+    setSimulating(true);
+    await createDummyOrder();
+    setSimulating(false);
+  };
+
+  const cards = [
+    { icon: 'package', label: 'Total Produk', value: fmtNum(products.length), sub: 'SKU aktif di semua toko', tint: 'bg-brand-50 text-brand-600' },
+    { icon: 'shopping-cart', label: 'Pesanan Hari Ini', value: fmtNum(ordersToday.length), sub: fmtIDR(revenueToday) + ' omzet', tint: 'bg-emerald-50 text-emerald-600' },
+    { icon: 'truck', label: 'Perlu Dikirim', value: fmtNum(needShip.length), sub: 'pesanan menunggu packing', tint: 'bg-amber-50 text-amber-600' },
+    { icon: 'triangle-alert', label: 'Peringatan Stok', value: fmtNum(lowStock.length), sub: failedToday + ' order ditolak hari ini', tint: 'bg-rose-50 text-rose-600' },
+  ];
+
+  return (
+    <div className="space-y-5">
+      {/* Sapaan */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <h2 className="text-xl sm:text-2xl font-extrabold tracking-tight">Halo, {user?.name?.split(' ')[0] || 'Bos'} 👋</h2>
+          <p className="text-sm text-slate-500">{new Date(now).toLocaleDateString('id-ID', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })} • {settings.storeName}</p>
+        </div>
+        <button onClick={simulate} disabled={simulating}
+          className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-sm font-bold shadow-md disabled:opacity-60">
+          <Icon name="zap" className={'w-4 h-4 ' + (simulating ? 'spin' : '')} />
+          {simulating ? 'Memproses…' : 'Simulasi Pesanan Masuk'}
+        </button>
+      </div>
+
+      {/* Banner stok menipis */}
+      {lowStock.length > 0 && (
+        <div className="anim-fade-up flex items-start gap-3 p-4 rounded-2xl bg-amber-50 border border-amber-200">
+          <Icon name="triangle-alert" className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+          <div className="text-sm">
+            <span className="font-bold text-amber-800">{lowStock.length} produk stok menipis: </span>
+            <span className="text-amber-700">{lowStock.slice(0, 3).map((p) => p.name.split(' ').slice(0, 3).join(' ') + ' (' + p.masterStock + ')').join(', ')}{lowStock.length > 3 ? '…' : ''}</span>
+            <button onClick={() => go('produk')} className="ml-2 font-bold text-amber-800 underline underline-offset-2">Restock sekarang</button>
+          </div>
+        </div>
+      )}
+
+      {/* Kartu statistik */}
+      <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 sm:gap-4">
+        {cards.map((c, i) => (
+          <div key={i} className="anim-fade-up bg-white rounded-2xl border border-slate-100 p-4 sm:p-5 shadow-sm" style={{ animationDelay: (i * 60) + 'ms' }}>
+            <div className={'w-10 h-10 rounded-xl flex items-center justify-center mb-3 ' + c.tint}><Icon name={c.icon} className="w-5 h-5" /></div>
+            <div className="text-2xl sm:text-3xl font-extrabold tracking-tight">{c.value}</div>
+            <div className="text-xs font-bold text-slate-500 mt-1">{c.label}</div>
+            <div className="text-[11px] text-slate-400 mt-0.5">{c.sub}</div>
+          </div>
+        ))}
+      </div>
+
+      <div className="grid lg:grid-cols-3 gap-4 sm:gap-5">
+        {/* Grafik */}
+        <div className="lg:col-span-2 bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+          <div className="flex items-center justify-between mb-1">
+            <div>
+              <h3 className="font-bold">Penjualan 7 Hari Terakhir</h3>
+              <p className="text-xs text-slate-400">Gabungan Shopee, Tokopedia, TikTok Shop & Lazada</p>
+            </div>
+            <div className="text-right">
+              <div className="font-extrabold text-brand-600">{fmtIDR(weekRevenue)}</div>
+              <div className="text-[11px] text-slate-400">total 7 hari</div>
+            </div>
+          </div>
+          <SalesChart data={chartData} />
+        </div>
+
+        {/* Log realtime */}
+        <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm flex flex-col">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="font-bold flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-emerald-500 pulse-dot"></span>Log Sync Realtime</h3>
+            <button onClick={() => go('log')} className="text-xs font-bold text-brand-600 hover:underline">Semua</button>
+          </div>
+          <div className="flex-1 space-y-3 overflow-y-auto max-h-[380px] pr-1">
+            {logs.slice(0, 8).map((l) => (
+              <div key={l.id} className="anim-fade-up flex gap-2.5 text-[13px] leading-snug">
+                <span className={'mt-1.5 w-2 h-2 rounded-full shrink-0 ' + (l.status === 'success' ? 'bg-emerald-500' : l.status === 'failed' ? 'bg-rose-500' : 'bg-amber-500')}></span>
+                <div className="min-w-0">
+                  <p className="text-slate-700">{l.message}</p>
+                  <p className="text-[11px] text-slate-400 mt-0.5">{timeAgo(l.createdAt, now)} • <StatusBadge status={l.status} /></p>
+                </div>
+              </div>
+            ))}
+            {!logs.length && <p className="text-sm text-slate-400 text-center py-8">Belum ada aktivitas sync.</p>}
+          </div>
+        </div>
+      </div>
+
+      {/* Produk terlaris */}
+      <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="font-bold">Produk Terlaris Minggu Ini</h3>
+          <button onClick={() => go('produk')} className="text-xs font-bold text-brand-600 hover:underline">Kelola Produk</button>
+        </div>
+        <div className="grid sm:grid-cols-2 lg:grid-cols-3 gap-3">
+          {topProducts(products, orders, 3).map((t, i) => (
+            <div key={t.id} className="flex items-center gap-3 p-3 rounded-xl bg-slate-50 border border-slate-100">
+              <span className="text-lg font-extrabold text-slate-300 w-6">#{i + 1}</span>
+              <div className={'w-11 h-11 rounded-xl bg-gradient-to-br flex items-center justify-center shrink-0 ' + t.grad}><Icon name={t.icon} className="w-5 h-5 text-white" /></div>
+              <div className="min-w-0 flex-1">
+                <div className="text-sm font-bold truncate">{t.name}</div>
+                <div className="text-[11px] text-slate-400">{t.qty} terjual • stok {t.masterStock}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function topProducts(products, orders, n) {
+  const map = {};
+  orders.forEach((o) => { if (o.status !== 'dibatalkan') map[o.productId] = (map[o.productId] || 0) + o.qty; });
+  return products
+    .map((p) => Object.assign({}, p, { qty: map[p.id] || 0 }))
+    .sort((a, b) => b.qty - a.qty)
+    .slice(0, n);
+}
+
+/* ===================== HALAMAN PRODUK ===================== */
+function ProductsPage() {
+  const products = useStore((s) => s.products);
+  const settings = useStore((s) => s.settings);
+  const [q, setQ] = useState('');
+  const [cat, setCat] = useState('Semua');
+  const [modal, setModal] = useState(null);       // add | edit | bulk | import
+  const [editing, setEditing] = useState(null);   // produk yg diedit
+  const [selling, setSelling] = useState(null);   // produk utk quick-sell
+
+  const cats = useMemo(() => ['Semua', ...Array.from(new Set(products.map((p) => p.category)))], [products]);
+  const filtered = products.filter((p) =>
+    (cat === 'Semua' || p.category === cat) &&
+    (p.name.toLowerCase().includes(q.toLowerCase()) || p.sku.toLowerCase().includes(q.toLowerCase()))
+  );
+
+  const removeProduct = (p) => {
+    if (!window.confirm('Hapus "' + p.name + '" dari semua toko?')) return;
+    store.setState((s) => ({ products: s.products.filter((x) => x.id !== p.id) }));
+    addLog({ productName: p.name, source: 'shopee', status: 'info', message: 'INFO: ' + p.name + ' dihapus dari katalog (' + p.sku + ')' });
+    toast('Produk ' + p.name + ' dihapus.', 'info');
+  };
+
+  const exportProducts = () => {
+    downloadCSV('stoksync-produk-' + new Date().toISOString().slice(0, 10) + '.csv',
+      products.map((p) => ({
+        nama: p.name, sku: p.sku, kategori: p.category, stok_master: p.masterStock,
+        stok_shopee: p.stocks.shopee, stok_tokopedia: p.stocks.tokopedia, stok_tiktok: p.stocks.tiktok, stok_lazada: p.stocks.lazada,
+        harga_shopee: p.prices.shopee, harga_tokopedia: p.prices.tokopedia, harga_tiktok: p.prices.tiktok, harga_lazada: p.prices.lazada,
+      })));
+    toast(products.length + ' produk diekspor ke CSV.', 'success');
+  };
+
+  const priceRange = (p) => {
+    const vals = MP.map((m) => p.prices[m.id]).filter((v) => v != null);
+    const min = Math.min.apply(null, vals), max = Math.max.apply(null, vals);
+    return min === max ? fmtIDR(min) : fmtIDR(min) + ' – ' + fmtIDR(max);
+  };
+
+  const stockCell = (val) => (
+    <span className={'inline-flex items-center justify-center min-w-[34px] px-1.5 py-0.5 rounded-md text-xs font-bold ' + (val <= 0 ? 'bg-rose-100 text-rose-700' : val <= 5 ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-700')}>{val}</span>
+  );
+
+  return (
+    <div className="space-y-4">
+      {/* Toolbar */}
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 min-w-[180px]">
+          <Icon name="search" className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Cari nama / SKU…" className={inputCls + ' pl-10'} />
+        </div>
+        <select value={cat} onChange={(e) => setCat(e.target.value)} className={inputCls + ' w-auto'}>
+          {cats.map((c) => <option key={c}>{c}</option>)}
+        </select>
+        <div className="flex gap-2 ml-auto">
+          <button onClick={() => setModal('import')} className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm font-bold text-slate-600 hover:border-brand-400 hover:text-brand-700"><Icon name="upload" className="w-4 h-4" /><span className="hidden sm:inline">Import</span></button>
+          <button onClick={exportProducts} className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm font-bold text-slate-600 hover:border-brand-400 hover:text-brand-700"><Icon name="download" className="w-4 h-4" /><span className="hidden sm:inline">Export</span></button>
+          <button onClick={() => setModal('bulk')} className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm font-bold text-slate-600 hover:border-brand-400 hover:text-brand-700"><Icon name="banknote" className="w-4 h-4" /><span className="hidden sm:inline">Harga Massal</span></button>
+          <button onClick={() => { setEditing(null); setModal('add'); }} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-md"><Icon name="plus" className="w-4 h-4" />Tambah</button>
+        </div>
+      </div>
+
+      {filtered.length === 0 ? (
+        <EmptyState icon="package" title={products.length ? 'Tidak ada produk yang cocok' : 'Belum ada produk'}
+          desc={products.length ? 'Coba kata kunci atau kategori lain.' : 'Tambah produk pertamamu atau import dari CSV biar langsung jalan.'}
+          action={<button onClick={() => { setEditing(null); setModal('add'); }} className="px-5 py-2.5 rounded-xl bg-brand-600 text-white text-sm font-bold">+ Tambah Produk</button>} />
+      ) : (
+        <React.Fragment>
+          {/* Tabel desktop */}
+          <div className="hidden md:block bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm min-w-[880px]">
+                <thead>
+                  <tr className="text-left text-xs text-slate-400 border-b border-slate-100 bg-slate-50/60">
+                    <th className="px-5 py-3 font-bold">Produk</th>
+                    <th className="px-3 py-3 font-bold">Stok Master</th>
+                    <th className="px-3 py-3 font-bold text-center" colSpan="4">Stok per Marketplace</th>
+                    <th className="px-3 py-3 font-bold">Harga</th>
+                    <th className="px-5 py-3 font-bold text-right">Aksi</th>
+                  </tr>
+                  <tr className="text-[10px] text-slate-400 border-b border-slate-100 bg-slate-50/40">
+                    <th></th><th></th>
+                    {MP.map((m) => <th key={m.id} className="py-1.5 font-bold text-center"><span className="inline-flex w-5 h-5 rounded-full text-white text-[9px] font-bold items-center justify-center" style={{ background: m.color }}>{m.letter}</span></th>)}
+                    <th></th><th></th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-50">
+                  {filtered.map((p) => (
+                    <tr key={p.id} className="hover:bg-slate-50/60">
+                      <td className="px-5 py-3">
+                        <div className="flex items-center gap-3">
+                          <div className={'w-11 h-11 rounded-xl bg-gradient-to-br flex items-center justify-center shrink-0 ' + p.grad}><Icon name={p.icon} className="w-5 h-5 text-white" /></div>
+                          <div className="min-w-0"><div className="font-bold truncate max-w-[220px]">{p.name}</div><div className="text-[11px] text-slate-400 font-mono">{p.sku} • {p.category}</div></div>
+                        </div>
+                      </td>
+                      <td className="px-3 py-3">
+                        <span className={'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg font-extrabold ' + (p.masterStock <= 0 ? 'bg-rose-100 text-rose-700' : p.masterStock <= 5 ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700')}>
+                          <Icon name="package" className="w-3.5 h-3.5" />{p.masterStock}
+                        </span>
+                      </td>
+                      {MP.map((m) => <td key={m.id} className="px-1 py-3 text-center">{stockCell(p.stocks[m.id])}</td>)}
+                      <td className="px-3 py-3 font-semibold whitespace-nowrap">{priceRange(p)}</td>
+                      <td className="px-5 py-3">
+                        <div className="flex justify-end gap-1">
+                          <button title="Simulasi laku" onClick={() => setSelling(p)} className="p-2 rounded-lg text-amber-600 hover:bg-amber-50"><Icon name="zap" className="w-4 h-4" /></button>
+                          <button title="Edit" onClick={() => { setEditing(p); setModal('edit'); }} className="p-2 rounded-lg text-slate-400 hover:text-brand-600 hover:bg-brand-50"><Icon name="pencil" className="w-4 h-4" /></button>
+                          <button title="Hapus" onClick={() => removeProduct(p)} className="p-2 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50"><Icon name="trash-2" className="w-4 h-4" /></button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Kartu mobile */}
+          <div className="md:hidden space-y-3">
+            {filtered.map((p) => (
+              <div key={p.id} className="bg-white rounded-2xl border border-slate-100 p-4 shadow-sm">
+                <div className="flex items-center gap-3">
+                  <div className={'w-12 h-12 rounded-xl bg-gradient-to-br flex items-center justify-center shrink-0 ' + p.grad}><Icon name={p.icon} className="w-6 h-6 text-white" /></div>
+                  <div className="min-w-0 flex-1">
+                    <div className="font-bold text-sm truncate">{p.name}</div>
+                    <div className="text-[11px] text-slate-400 font-mono">{p.sku}</div>
+                  </div>
+                  <span className={'px-2.5 py-1 rounded-lg font-extrabold text-sm ' + (p.masterStock <= 0 ? 'bg-rose-100 text-rose-700' : p.masterStock <= 5 ? 'bg-amber-100 text-amber-700' : 'bg-emerald-100 text-emerald-700')}>{p.masterStock}</span>
+                </div>
+                <div className="grid grid-cols-4 gap-1.5 mt-3">
+                  {MP.map((m) => (
+                    <div key={m.id} className="rounded-lg bg-slate-50 border border-slate-100 py-1.5 text-center">
+                      <div className="text-[10px] font-bold" style={{ color: m.color }}>{m.letter}</div>
+                      <div className={'text-xs font-extrabold ' + (p.stocks[m.id] <= 0 ? 'text-rose-600' : 'text-slate-700')}>{p.stocks[m.id]}</div>
+                    </div>
+                  ))}
+                </div>
+                <div className="flex items-center justify-between mt-3 pt-3 border-t border-slate-50">
+                  <span className="text-sm font-bold text-slate-700">{priceRange(p)}</span>
+                  <div className="flex gap-1">
+                    <button onClick={() => setSelling(p)} className="flex items-center gap-1 px-3 py-1.5 rounded-lg text-xs font-bold text-amber-700 bg-amber-50"><Icon name="zap" className="w-3.5 h-3.5" />Laku</button>
+                    <button onClick={() => { setEditing(p); setModal('edit'); }} className="p-2 rounded-lg text-slate-400 hover:bg-slate-100"><Icon name="pencil" className="w-4 h-4" /></button>
+                    <button onClick={() => removeProduct(p)} className="p-2 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50"><Icon name="trash-2" className="w-4 h-4" /></button>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </React.Fragment>
+      )}
+
+      <ProductModal open={modal === 'add' || modal === 'edit'} editing={editing} onClose={() => setModal(null)} />
+      <BulkPriceModal open={modal === 'bulk'} onClose={() => setModal(null)} />
+      <ImportModal open={modal === 'import'} onClose={() => setModal(null)} />
+      <QuickSellModal product={selling} onClose={() => setSelling(null)} />
+    </div>
+  );
+}
+
+/* ---------- Modal tambah / edit produk ---------- */
+function ProductModal({ open, editing, onClose }) {
+  const settings = useStore((s) => s.settings);
+  const [name, setName] = useState('');
+  const [sku, setSku] = useState('');
+  const [category, setCategory] = useState('Fashion');
+  const [stock, setStock] = useState(20);
+  const [price, setPrice] = useState(50000);
+
+  useEffect(() => {
+    if (open) {
+      setName(editing?.name || '');
+      setSku(editing?.sku || '');
+      setCategory(editing?.category || 'Fashion');
+      setStock(editing?.masterStock ?? 20);
+      setPrice(editing?.prices?.shopee ?? 50000);
+    }
+  }, [open]);
+
+  const save = () => {
+    if (!name.trim()) { toast('Nama produk wajib diisi.', 'warning'); return; }
+    const s = store.getState();
+    if (editing) {
+      const stockChanged = Number(stock) !== editing.masterStock;
+      const newMaster = Math.max(0, Math.floor(Number(stock) || 0));
+      const newPrices = { shopee: +price || 0, tokopedia: +price || 0, tiktok: +price || 0, lazada: +price || 0 };
+      const newStocks = Object.assign({}, editing.stocks);
+      if (stockChanged) {
+        /* Stok master berubah → push ulang ke semua toko terhubung */
+        const val = sellableOf({ masterStock: newMaster }, s.settings);
+        s.marketplaces.filter((m) => m.connected).forEach((m) => { newStocks[m.id] = val; });
+        addLog({ productName: name.trim(), source: 'shopee', status: 'info', message: 'INFO: stok master ' + name.trim() + ' diubah manual ' + editing.masterStock + '→' + newMaster + ', semua toko tersinkron' });
+      }
+      store.setState((st) => ({ products: st.products.map((p) => p.id === editing.id ? Object.assign({}, p, { name: name.trim(), sku: sku.trim() || p.sku, category, masterStock: newMaster, stocks: newStocks, prices: newPrices }) : p) }));
+      toast('Produk "' + name.trim() + '" diperbarui.', 'success');
+    } else {
+      const master = Math.max(0, Math.floor(Number(stock) || 0));
+      const pr = Math.max(0, Math.floor(Number(price) || 0));
+      const p = {
+        id: uid('prd'), name: name.trim(), sku: (sku.trim() || 'SKU-' + Date.now().toString(36).toUpperCase()), category,
+        icon: 'package', grad: 'from-brand-500 to-violet-700', masterStock: master,
+        stocks: { shopee: master, tokopedia: master, tiktok: master, lazada: master },
+        prices: { shopee: pr, tokopedia: pr, tiktok: pr, lazada: pr }, createdAt: Date.now(),
+      };
+      store.setState((st) => ({ products: [p, ...st.products] }));
+      addLog({ productName: p.name, source: 'shopee', status: 'info', message: 'INFO: produk baru ' + p.name + ' ditambahkan (stok master ' + master + ')' });
+      toast('Produk "' + p.name + '" ditambahkan ke semua toko.', 'success');
+    }
+    onClose();
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title={editing ? 'Edit Produk' : 'Tambah Produk Baru'} subtitle="Stok master = stok asli di gudangmu.">
+      <div className="space-y-4">
+        <Field label="Nama produk"><input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} placeholder="cth: Kaos Polos Hitam Cotton Combed" /></Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="SKU"><input className={inputCls} value={sku} onChange={(e) => setSku(e.target.value)} placeholder="cth: KOS-HTM-001" /></Field>
+          <Field label="Kategori">
+            <select className={inputCls} value={category} onChange={(e) => setCategory(e.target.value)}>
+              {['Fashion', 'Makanan', 'Minuman', 'Kesehatan', 'Kerajinan', 'Home & Living', 'Elektronik', 'Lainnya'].map((c) => <option key={c}>{c}</option>)}
+            </select>
+          </Field>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Stok master (gudang)" hint={settings.preventOverselling ? 'Buffer ' + settings.buffer + ' pcs disisihkan otomatis.' : ''}>
+            <input type="number" min="0" className={inputCls} value={stock} onChange={(e) => setStock(e.target.value)} />
+          </Field>
+          <Field label="Harga dasar (Rp)" hint="Disamakan ke semua marketplace.">
+            <input type="number" min="0" step="500" className={inputCls} value={price} onChange={(e) => setPrice(e.target.value)} />
+          </Field>
+        </div>
+        <button onClick={save} className="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-md">
+          {editing ? 'Simpan Perubahan' : 'Tambah ke Semua Toko'}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------- Modal simulasi pesanan per produk ---------- */
+function QuickSellModal({ product, onClose }) {
+  const mps = useStore((s) => s.marketplaces);
+  const [mp, setMp] = useState('shopee');
+  const [qty, setQty] = useState(1);
+  const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    if (product) {
+      const connected = mps.filter((m) => m.connected);
+      setMp((connected[0] || mps[0]).id);
+      setQty(1); setBusy(false);
+    }
+  }, [product]);
+  if (!product) return null;
+
+  const submit = async () => {
+    setBusy(true);
+    const r = await handleOrder(product.id, mp, qty);
+    setBusy(false);
+    if (r.ok) onClose();
+  };
+
+  return (
+    <Modal open={!!product} onClose={onClose} title="Simulasi Pesanan Masuk" subtitle={product.name}>
+      <div className="space-y-4">
+        <Field label="Marketplace sumber">
+          <select className={inputCls} value={mp} onChange={(e) => setMp(e.target.value)}>
+            {mps.map((m) => <option key={m.id} value={m.id}>{mpById(m.id).name}{m.connected ? '' : ' (belum terhubung)'}</option>)}
+          </select>
+        </Field>
+        <Field label="Jumlah (qty)">
+          <div className="flex items-center gap-3">
+            <button onClick={() => setQty(Math.max(1, qty - 1))} className="w-10 h-10 rounded-xl border border-slate-200 font-bold text-lg hover:bg-slate-50">−</button>
+            <span className="text-xl font-extrabold w-10 text-center">{qty}</span>
+            <button onClick={() => setQty(qty + 1)} className="w-10 h-10 rounded-xl border border-slate-200 font-bold text-lg hover:bg-slate-50">+</button>
+            <span className="text-xs text-slate-400 ml-1">Stok master: {product.masterStock}</span>
+          </div>
+        </Field>
+        <div className="rounded-xl bg-slate-50 border border-slate-100 p-3.5 text-xs text-slate-500 leading-relaxed">
+          Saat diklik, StokSync akan: cek stok → kurangi <b>stok master</b> → push ke <b>semua toko terhubung</b> → catat log. persis seperti order asli.
+        </div>
+        <button onClick={submit} disabled={busy} className="w-full py-3 rounded-xl bg-amber-500 hover:bg-amber-600 text-white font-bold shadow-md disabled:opacity-60 flex items-center justify-center gap-2">
+          <Icon name={busy ? 'refresh-cw' : 'zap'} className={'w-4 h-4 ' + (busy ? 'spin' : '')} />
+          {busy ? 'Menyinkronkan…' : 'Buat Pesanan & Sync Stok'}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------- Modal edit harga massal ---------- */
+function BulkPriceModal({ open, onClose }) {
+  const settings = useStore((s) => s.settings);
+  const [target, setTarget] = useState('tiktok');
+  const [percent, setPercent] = useState(10);
+
+  const apply = (pct, tgt) => {
+    const p = Number(pct);
+    if (!p || p <= -100) { toast('Persentase tidak valid.', 'warning'); return; }
+    /* 'all' = preset semua marketplace; syncPrice aktif = selalu semua */
+    const targets = (tgt === 'all' || settings.syncPrice) ? MP.map((m) => m.id) : [tgt || target];
+    store.setState((st) => ({
+      products: st.products.map((prod) => {
+        const prices = Object.assign({}, prod.prices);
+        targets.forEach((tid) => { prices[tid] = Math.max(0, Math.round((prices[tid] || 0) * (1 + p / 100))); });
+        return Object.assign({}, prod, { prices });
+      }),
+    }));
+    const names = targets.map((t) => mpById(t).name).join(', ');
+    addLog({ productName: 'Semua produk', source: target, status: 'info', message: 'INFO: harga massal ' + (p > 0 ? '+' : '') + p + '% diterapkan untuk ' + names + ' (' + store.getState().products.length + ' SKU)' });
+    toast('Harga ' + (p > 0 ? 'naik' : 'turun') + ' ' + Math.abs(p) + '% untuk ' + names + '.', 'success');
+    onClose();
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title="Edit Harga Massal" subtitle="Ubah harga banyak SKU sekaligus per marketplace.">
+      <div className="space-y-4">
+        <div className="flex flex-wrap gap-2">
+          {[['+10% TikTok', 10, 'tiktok'], ['+5% Semua MP', 5, 'all'], ['-10% Shopee', -10, 'shopee']].map((c, i) => (
+            <button key={i} onClick={() => apply(c[1], c[2])}
+              className="px-3 py-2 rounded-xl bg-brand-50 border border-brand-100 text-xs font-bold text-brand-700 hover:bg-brand-100">{c[0]}</button>
+          ))}
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Marketplace target">
+            <select className={inputCls} value={target} onChange={(e) => setTarget(e.target.value)}>
+              {MP.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          </Field>
+          <Field label="Persentase (%)" hint="Negatif untuk diskon.">
+            <input type="number" className={inputCls} value={percent} onChange={(e) => setPercent(e.target.value)} placeholder="cth: 10" />
+          </Field>
+        </div>
+        {settings.syncPrice && <p className="text-xs text-sky-600 bg-sky-50 border border-sky-200 rounded-xl px-3 py-2">“Sync harga juga” aktif — perubahan akan diterapkan ke SEMUA marketplace.</p>}
+        <button onClick={() => apply(percent, target)} className="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-md">Terapkan ke Semua Produk</button>
+      </div>
+    </Modal>
+  );
+}
+
+/* ---------- Modal import CSV ---------- */
+function ImportModal({ open, onClose }) {
+  const fileRef = useRef(null);
+  const [preview, setPreview] = useState([]);
+  const [fileName, setFileName] = useState('');
+
+  const downloadTemplate = () => {
+    downloadCSV('template-import-stoksync.csv', [
+      { nama: 'Kaos Polos Putih', sku: 'KOS-PTH-011', kategori: 'Fashion', stok: 50, harga: 45000 },
+      { nama: 'Kopi Tubruk 250g', sku: 'KOP-TBR-012', kategori: 'Minuman', stok: 30, harga: 28000 },
+    ]);
+  };
+
+  const onFile = (e) => {
+    const f = e.target.files[0];
+    if (!f) return;
+    setFileName(f.name);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const rows = parseCSV(String(reader.result || ''));
+      setPreview(rows.slice(0, 5));
+      e.target._rows = rows;
+    };
+    reader.readAsText(f);
+  };
+
+  const doImport = () => {
+    const rows = (fileRef.current && fileRef.current._rows) || [];
+    if (!rows.length) { toast('Pilih file CSV dulu.', 'warning'); return; }
+    let added = 0;
+    const news = [];
+    rows.forEach((r) => {
+      const nama = r.nama || r.name || r.produk;
+      if (!nama) return;
+      const master = Math.max(0, parseInt(r.stok || r.stock || r.stok_master || '0', 10) || 0);
+      const pr = Math.max(0, parseInt(r.harga || r.price || '0', 10) || 0);
+      news.push({
+        id: uid('prd'), name: String(nama).trim(), sku: String(r.sku || 'SKU-' + Date.now().toString(36).toUpperCase() + added).trim(),
+        category: String(r.kategori || r.category || 'Lainnya').trim(), icon: 'package', grad: 'from-brand-500 to-violet-700',
+        masterStock: master,
+        stocks: { shopee: master, tokopedia: master, tiktok: master, lazada: master },
+        prices: { shopee: pr, tokopedia: pr, tiktok: pr, lazada: pr }, createdAt: Date.now(),
+      });
+      added++;
+    });
+    if (!added) { toast('Tidak ada baris valid. Cek format CSV-mu.', 'error'); return; }
+    store.setState((s) => ({ products: [...news, ...s.products] }));
+    addLog({ productName: added + ' produk', source: 'shopee', status: 'info', message: 'INFO: import CSV ' + fileName + ' — ' + added + ' produk ditambahkan' });
+    toast(added + ' produk berhasil diimport.', 'success');
+    setPreview([]); setFileName('');
+    onClose();
+  };
+
+  return (
+    <Modal open={open} onClose={onClose} title="Import Produk dari CSV" subtitle="Kolom: nama, sku, kategori, stok, harga.">
+      <div className="space-y-4">
+        <button onClick={downloadTemplate} className="flex items-center gap-2 text-sm font-bold text-brand-600 hover:underline"><Icon name="download" className="w-4 h-4" />Unduh template CSV</button>
+        <input ref={fileRef} type="file" accept=".csv" onChange={onFile} className="hidden" id="csvFile" />
+        <label htmlFor="csvFile" className="flex flex-col items-center justify-center gap-2 border-2 border-dashed border-slate-200 rounded-2xl py-8 cursor-pointer hover:border-brand-400 hover:bg-brand-50/40 transition">
+          <Icon name="upload" className="w-8 h-8 text-slate-300" />
+          <span className="text-sm font-bold text-slate-600">{fileName || 'Klik untuk pilih file .csv'}</span>
+          <span className="text-xs text-slate-400">maksimal 500 baris per import</span>
+        </label>
+        {preview.length > 0 && (
+          <div className="rounded-xl border border-slate-100 overflow-hidden">
+            <div className="px-3 py-2 bg-slate-50 text-xs font-bold text-slate-500">Preview ({preview.length} baris pertama)</div>
+            {preview.map((r, i) => <div key={i} className="px-3 py-2 text-xs border-t border-slate-50 truncate">{r.nama || r.name || '(tanpa nama)'} • stok {r.stok || r.stock || 0} • {fmtIDR(parseInt(r.harga || r.price || '0', 10) || 0)}</div>)}
+          </div>
+        )}
+        <button onClick={doImport} className="w-full py-3 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-bold shadow-md">Import Sekarang</button>
+      </div>
+    </Modal>
+  );
+}
+
+/* ===================== HALAMAN PESANAN ===================== */
+function OrdersPage() {
+  const orders = useStore((s) => s.orders);
+  const now = useStore((s) => s.now);
+  const [filter, setFilter] = useState('semua');
+  const [busy, setBusy] = useState(false);
+
+  const filtered = orders.filter((o) => filter === 'semua' || o.status === filter);
+
+  const markShipped = (id) => {
+    store.setState((s) => ({ orders: s.orders.map((o) => o.id === id ? Object.assign({}, o, { status: 'dikirim' }) : o) }));
+    toast('Pesanan ditandai sudah dikirim.', 'success');
+  };
+
+  const dummy = async (n) => {
+    if (busy) return;
+    setBusy(true);
+    for (let i = 0; i < n; i++) { await createDummyOrder(); }
+    setBusy(false);
+  };
+
+  const exportOrders = () => {
+    downloadCSV('stoksync-pesanan-' + new Date().toISOString().slice(0, 10) + '.csv',
+      orders.map((o) => ({ kode: o.code, waktu: new Date(o.createdAt).toLocaleString('id-ID'), produk: o.productName, marketplace: mpById(o.marketplace).name, qty: o.qty, total: o.total, pembeli: o.buyer, status: o.status })));
+    toast(orders.length + ' pesanan diekspor ke CSV.', 'success');
+  };
+
+  const tabs = [['semua', 'Semua'], ['perlu_dikirim', 'Perlu Dikirim'], ['dikirim', 'Dikirim']];
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="flex gap-1 p-1 bg-white border border-slate-100 rounded-xl shadow-sm">
+          {tabs.map((t) => (
+            <button key={t[0]} onClick={() => setFilter(t[0])}
+              className={'px-3.5 py-2 rounded-lg text-xs font-bold transition ' + (filter === t[0] ? 'bg-slate-900 text-white' : 'text-slate-500 hover:text-slate-800')}>
+              {t[1]}
+              <span className={'ml-1.5 px-1.5 rounded-md ' + (filter === t[0] ? 'bg-white/20' : 'bg-slate-100')}>{t[0] === 'semua' ? orders.length : orders.filter((o) => o.status === t[0]).length}</span>
+            </button>
+          ))}
+        </div>
+        <div className="flex gap-2 ml-auto">
+          <button onClick={exportOrders} className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm font-bold text-slate-600 hover:border-brand-400 hover:text-brand-700"><Icon name="download" className="w-4 h-4" /><span className="hidden sm:inline">Export</span></button>
+          <button onClick={() => dummy(1)} disabled={busy} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold shadow-md disabled:opacity-60">
+            <Icon name={busy ? 'refresh-cw' : 'zap'} className={'w-4 h-4 ' + (busy ? 'spin' : '')} />{busy ? 'Memproses…' : 'Buat Pesanan Dummy'}
+          </button>
+        </div>
+      </div>
+
+      <p className="text-xs text-slate-400 flex items-center gap-1.5"><Icon name="info" className="w-3.5 h-3.5" />Setiap pesanan dummy memicu <b>handleOrder()</b>: stok master berkurang & semua toko tersinkron otomatis.</p>
+
+      {filtered.length === 0 ? (
+        <EmptyState icon="shopping-cart" title="Belum ada pesanan" desc="Buat pesanan dummy untuk melihat mesin sinkronisasi bekerja secara realtime."
+          action={<button onClick={() => dummy(1)} className="px-5 py-2.5 rounded-xl bg-brand-600 text-white text-sm font-bold">+ Buat Pesanan Dummy</button>} />
+      ) : (
+        <React.Fragment>
+          {/* Desktop */}
+          <div className="hidden md:block bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
+            <table className="w-full text-sm">
+              <thead><tr className="text-left text-xs text-slate-400 border-b border-slate-100 bg-slate-50/60">
+                <th className="px-5 py-3 font-bold">Kode / Waktu</th><th className="px-3 py-3 font-bold">Produk</th><th className="px-3 py-3 font-bold">Marketplace</th><th className="px-3 py-3 font-bold text-center">Qty</th><th className="px-3 py-3 font-bold">Total</th><th className="px-3 py-3 font-bold">Status</th><th className="px-5 py-3 font-bold text-right">Aksi</th>
+              </tr></thead>
+              <tbody className="divide-y divide-slate-50">
+                {filtered.map((o) => (
+                  <tr key={o.id} className="hover:bg-slate-50/60">
+                    <td className="px-5 py-3"><div className="font-mono text-xs font-bold">{o.code}</div><div className="text-[11px] text-slate-400">{timeAgo(o.createdAt, now)} • {o.buyer}</div></td>
+                    <td className="px-3 py-3 font-semibold max-w-[220px] truncate">{o.productName}</td>
+                    <td className="px-3 py-3"><MpBadge id={o.marketplace} /></td>
+                    <td className="px-3 py-3 text-center font-bold">{o.qty}</td>
+                    <td className="px-3 py-3 font-bold">{fmtIDR(o.total)}</td>
+                    <td className="px-3 py-3"><StatusBadge status={o.status} /></td>
+                    <td className="px-5 py-3 text-right">
+                      {o.status === 'perlu_dikirim'
+                        ? <button onClick={() => markShipped(o.id)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-emerald-700 bg-emerald-50 hover:bg-emerald-100"><Icon name="truck" className="w-3.5 h-3.5" />Kirim</button>
+                        : <span className="text-[11px] text-slate-300 font-bold">—</span>}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          {/* Mobile */}
+          <div className="md:hidden space-y-3">
+            {filtered.map((o) => (
+              <div key={o.id} className="bg-white rounded-2xl border border-slate-100 p-4 shadow-sm">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="font-mono text-xs font-bold">{o.code}</span>
+                  <StatusBadge status={o.status} />
+                </div>
+                <div className="mt-2 font-bold text-sm">{o.productName}</div>
+                <div className="mt-1.5 flex items-center gap-3 text-xs text-slate-500">
+                  <MpBadge id={o.marketplace} size="sm" />
+                  <span>{o.qty} pcs</span><span className="font-bold text-slate-800">{fmtIDR(o.total)}</span>
+                </div>
+                <div className="mt-2 pt-2 border-t border-slate-50 flex items-center justify-between">
+                  <span className="text-[11px] text-slate-400">{o.buyer} • {timeAgo(o.createdAt, now)}</span>
+                  {o.status === 'perlu_dikirim' && <button onClick={() => markShipped(o.id)} className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold text-emerald-700 bg-emerald-50"><Icon name="truck" className="w-3.5 h-3.5" />Tandai Dikirim</button>}
+                </div>
+              </div>
+            ))}
+          </div>
+        </React.Fragment>
+      )}
+    </div>
+  );
+}
+
+/* ===================== HALAMAN TOKO TERHUBUNG ===================== */
+const DOC_LINKS = [
+  ['Shopee Open Platform', 'https://open.shopee.com/'],
+  ['Tokopedia Developer', 'https://developer.tokopedia.com/'],
+  ['TikTok Shop Partner Center', 'https://partner.tiktokshop.com/'],
+  ['Lazada Open Platform', 'https://open.lazada.com/'],
+];
+
+function StoresPage() {
+  const mps = useStore((s) => s.marketplaces);
+  const now = useStore((s) => s.now);
+  const [connecting, setConnecting] = useState(null);
+  const [apiKey, setApiKey] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const openConnect = (id) => { setConnecting(id); setApiKey(''); setBusy(false); };
+  const genKey = () => setApiKey('sk_live_' + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6));
+
+  const doConnect = async () => {
+    if (!apiKey.trim()) { toast('Masukkan API key dulu (atau generate dummy).', 'warning'); return; }
+    setBusy(true);
+    await delay(900); /* simulasi handshake API */
+    const masked = apiKey.slice(0, 7) + '•••• •••• ' + apiKey.slice(-4);
+    store.setState((s) => ({ marketplaces: s.marketplaces.map((m) => m.id === connecting ? Object.assign({}, m, { connected: true, apiKey: masked, lastSync: Date.now() }) : m) }));
+    addLog({ productName: mpById(connecting).name, source: connecting, status: 'info', message: 'INFO: toko ' + mpById(connecting).name + ' terhubung (simulasi API). Stok awal diselaraskan.' });
+    toast(mpById(connecting).name + ' berhasil terhubung!', 'success');
+    setBusy(false); setConnecting(null);
+  };
+
+  const disconnect = (id) => {
+    if (!window.confirm('Putuskan ' + mpById(id).name + '? Stoknya tidak akan ikut tersinkron lagi.')) return;
+    store.setState((s) => ({ marketplaces: s.marketplaces.map((m) => m.id === id ? Object.assign({}, m, { connected: false, apiKey: '', lastSync: null }) : m) }));
+    addLog({ productName: mpById(id).name, source: id, status: 'warning', message: 'PERINGATAN: toko ' + mpById(id).name + ' diputus. Sinkronisasi ke toko ini dihentikan.' });
+    toast(mpById(id).name + ' diputus.', 'info');
+  };
+
+  const conn = mps.filter((m) => m.connected).length;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-start gap-3 p-4 rounded-2xl bg-sky-50 border border-sky-200">
+        <Icon name="info" className="w-5 h-5 text-sky-600 shrink-0 mt-0.5" />
+        <div className="text-sm text-sky-800 leading-relaxed">
+          <b>Mode simulasi aktif.</b> Koneksi di halaman ini memakai API key dummy agar alur sync bisa dicoba end-to-end.
+          Untuk production, ganti dengan <b>OAuth resmi</b> tiap marketplace — link dokumentasi resmi ada di bawah.
+        </div>
+      </div>
+
+      <div className="grid sm:grid-cols-2 gap-4">
+        {mps.map((m) => {
+          const meta = mpById(m.id);
+          return (
+            <div key={m.id} className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-center gap-3">
+                  <span className="w-12 h-12 rounded-2xl flex items-center justify-center text-white font-extrabold text-lg shadow" style={{ background: meta.color }}>{meta.letter}</span>
+                  <div>
+                    <div className="font-bold">{meta.name}</div>
+                    <div className="text-[11px] text-slate-400 font-mono">{m.connected ? m.apiKey : 'belum terhubung'}</div>
+                  </div>
+                </div>
+                <span className={'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-bold ' + (m.connected ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-500')}>
+                  <span className={'w-1.5 h-1.5 rounded-full ' + (m.connected ? 'bg-emerald-500 pulse-dot' : 'bg-slate-400')}></span>
+                  {m.connected ? 'Terhubung' : 'Terputus'}
+                </span>
+              </div>
+              <div className="mt-4 flex items-center justify-between">
+                <span className="text-xs text-slate-400">{m.lastSync ? 'Sync terakhir ' + timeAgo(m.lastSync, now) : 'Belum pernah sync'}</span>
+                {m.connected
+                  ? <button onClick={() => disconnect(m.id)} className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl text-xs font-bold text-rose-600 bg-rose-50 hover:bg-rose-100"><Icon name="unlink" className="w-3.5 h-3.5" />Putuskan</button>
+                  : <button onClick={() => openConnect(m.id)} className="flex items-center gap-1.5 px-4 py-2 rounded-xl text-xs font-bold text-white bg-slate-900 hover:bg-slate-700"><Icon name="plug-zap" className="w-3.5 h-3.5" />Hubungkan</button>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+        <h3 className="font-bold flex items-center gap-2"><Icon name="key-round" className="w-4 h-4 text-brand-600" />Dokumentasi API Resmi</h3>
+        <p className="text-xs text-slate-400 mt-1 mb-3">Untuk integrasi production (OAuth + webhook order realtime).</p>
+        <div className="grid sm:grid-cols-2 gap-2">
+          {DOC_LINKS.map((d, i) => (
+            <a key={i} href={d[1]} target="_blank" rel="noopener noreferrer" className="flex items-center justify-between px-4 py-3 rounded-xl border border-slate-100 hover:border-brand-300 hover:bg-brand-50/40 text-sm font-semibold text-slate-700">
+              {d[0]}<Icon name="external-link" className="w-4 h-4 text-slate-300" />
+            </a>
+          ))}
+        </div>
+      </div>
+
+      {/* Modal simulasi koneksi API */}
+      <Modal open={!!connecting} onClose={() => setConnecting(null)} title="Simulasi Koneksi API" subtitle={connecting ? 'Menghubungkan ' + mpById(connecting).name + '…' : ''}>
+        <div className="space-y-4">
+          <div className="rounded-xl bg-amber-50 border border-amber-200 p-3.5 text-xs text-amber-800 leading-relaxed">
+            Ini <b>simulasi</b> untuk keperluan demo. Di production, tombol ini membuka halaman <b>OAuth resmi marketplace</b> (login sebagai seller → authorize → token tersimpan aman di server).
+          </div>
+          <Field label="API Key (dummy)" hint="Klik Generate untuk membuat key dummy.">
+            <div className="flex gap-2">
+              <input className={inputCls + ' font-mono'} value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk_live_••••••••" />
+              <button onClick={genKey} className="shrink-0 px-3.5 rounded-xl border border-slate-200 text-xs font-bold text-slate-600 hover:border-brand-400 hover:text-brand-700">Generate</button>
+            </div>
+          </Field>
+          <button onClick={doConnect} disabled={busy} className="w-full py-3 rounded-xl bg-slate-900 hover:bg-slate-700 text-white font-bold disabled:opacity-60 flex items-center justify-center gap-2">
+            <Icon name={busy ? 'refresh-cw' : 'plug-zap'} className={'w-4 h-4 ' + (busy ? 'spin' : '')} />
+            {busy ? 'Menghubungkan…' : 'Hubungkan Toko'}
+          </button>
+        </div>
+      </Modal>
+    </div>
+  );
+}
+
+/* ===================== HALAMAN LOG SYNC ===================== */
+function LogsPage() {
+  const logs = useStore((s) => s.syncLogs);
+  const now = useStore((s) => s.now);
+  const [fStatus, setFStatus] = useState('semua');
+  const [q, setQ] = useState('');
+
+  const filtered = logs.filter((l) =>
+    (fStatus === 'semua' || l.status === fStatus) &&
+    l.message.toLowerCase().includes(q.toLowerCase())
+  );
+
+  const clear = () => {
+    if (!window.confirm('Hapus semua log sync?')) return;
+    store.setState({ syncLogs: [] });
+    toast('Log sync dibersihkan.', 'info');
+  };
+  const exportLogs = () => {
+    downloadCSV('stoksync-log-' + new Date().toISOString().slice(0, 10) + '.csv',
+      logs.map((l) => ({ waktu: new Date(l.createdAt).toLocaleString('id-ID'), produk: l.productName, marketplace: mpById(l.source).name, status: l.status, pesan: l.message })));
+    toast(logs.length + ' baris log diekspor.', 'success');
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 min-w-[160px]">
+          <Icon name="search" className="w-4 h-4 absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-400" />
+          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Cari di log…" className={inputCls + ' pl-10'} />
+        </div>
+        <select value={fStatus} onChange={(e) => setFStatus(e.target.value)} className={inputCls + ' w-auto'}>
+          <option value="semua">Semua status</option>
+          <option value="success">Sukses</option>
+          <option value="failed">Gagal</option>
+          <option value="warning">Peringatan</option>
+          <option value="info">Info</option>
+        </select>
+        <div className="flex gap-2 ml-auto">
+          <button onClick={exportLogs} className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm font-bold text-slate-600 hover:border-brand-400 hover:text-brand-700"><Icon name="download" className="w-4 h-4" /><span className="hidden sm:inline">Export</span></button>
+          <button onClick={clear} className="flex items-center gap-1.5 px-3.5 py-2.5 rounded-xl border border-slate-200 bg-white text-sm font-bold text-rose-600 hover:border-rose-300 hover:bg-rose-50"><Icon name="trash-2" className="w-4 h-4" /><span className="hidden sm:inline">Bersihkan</span></button>
+        </div>
+      </div>
+
+      {filtered.length === 0 ? (
+        <EmptyState icon="history" title="Tidak ada log" desc="Belum ada aktivitas sync yang cocok dengan filter." />
+      ) : (
+        <div className="bg-white rounded-2xl border border-slate-100 shadow-sm overflow-hidden">
+          <div className="divide-y divide-slate-50 max-h-[70vh] overflow-y-auto">
+            {filtered.map((l) => (
+              <div key={l.id} className="px-4 sm:px-5 py-3.5 flex items-start gap-3 hover:bg-slate-50/50">
+                <span className={'mt-1 w-2.5 h-2.5 rounded-full shrink-0 ' + (l.status === 'success' ? 'bg-emerald-500' : l.status === 'failed' ? 'bg-rose-500' : l.status === 'warning' ? 'bg-amber-500' : 'bg-sky-500')}></span>
+                <div className="min-w-0 flex-1">
+                  <p className="text-[13px] text-slate-700 leading-snug">{l.message}</p>
+                  <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                    <span className="text-[11px] text-slate-400 font-medium">{timeAgo(l.createdAt, now)} • {fmtTime(l.createdAt)}</span>
+                    <MpBadge id={l.source} size="sm" />
+                    <StatusBadge status={l.status} />
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ===================== HALAMAN PENGATURAN ===================== */
+function SettingsPage() {
+  const settings = useStore((s) => s.settings);
+  const user = useStore((s) => s.user);
+  const products = useStore((s) => s.products);
+  const orders = useStore((s) => s.orders);
+  const logs = useStore((s) => s.syncLogs);
+  const [storeName, setStoreName] = useState(settings.storeName);
+  const [ownerName, setOwnerName] = useState(user?.name || '');
+
+  const set = (patch, msg) => {
+    store.setState((s) => ({ settings: Object.assign({}, s.settings, patch) }));
+    if (msg) toast(msg, 'success');
+  };
+
+  const saveProfile = () => {
+    if (!storeName.trim()) { toast('Nama toko wajib diisi.', 'warning'); return; }
+    store.setState((s) => ({
+      settings: Object.assign({}, s.settings, { storeName: storeName.trim() }),
+      user: s.user ? Object.assign({}, s.user, { name: ownerName.trim() || s.user.name, storeName: storeName.trim() }) : s.user,
+    }));
+    toast('Profil toko disimpan.', 'success');
+  };
+
+  const backup = () => {
+    const s = store.getState();
+    const blob = new Blob([JSON.stringify({ products: s.products, marketplaces: s.marketplaces, orders: s.orders, syncLogs: s.syncLogs, settings: s.settings }, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'stoksync-backup-' + new Date().toISOString().slice(0, 10) + '.json';
+    document.body.appendChild(a); a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 500);
+    toast('Backup JSON diunduh.', 'success');
+  };
+
+  const resetAll = () => {
+    if (!window.confirm('Reset SEMUA data ke awal (produk, pesanan, log)? Tindakan ini tidak bisa dibatalkan.')) return;
+    try { localStorage.removeItem(LS_KEY); } catch (e) {}
+    window.location.reload();
+  };
+
+  const rules = [
+    { key: 'preventOverselling', icon: 'shield-check', title: 'Cegah overselling', desc: 'Jika stok tersisa sedikit, jangan jual ke toko lain. Order yang melebihi stok otomatis ditolak + tercatat di log.' },
+    { key: 'syncPrice', icon: 'banknote', title: 'Sync harga juga', desc: 'Saat edit harga massal, terapkan ke semua marketplace sekaligus (bukan per toko).' },
+  ];
+
+  return (
+    <div className="space-y-4 max-w-3xl">
+      {/* Profil */}
+      <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+        <h3 className="font-bold mb-4 flex items-center gap-2"><Icon name="store" className="w-4 h-4 text-brand-600" />Profil Toko</h3>
+        <div className="grid sm:grid-cols-2 gap-4">
+          <Field label="Nama toko / usaha"><input className={inputCls} value={storeName} onChange={(e) => setStoreName(e.target.value)} /></Field>
+          <Field label="Nama pemilik"><input className={inputCls} value={ownerName} onChange={(e) => setOwnerName(e.target.value)} /></Field>
+        </div>
+        <button onClick={saveProfile} className="mt-4 px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-sm font-bold">Simpan Profil</button>
+      </div>
+
+      {/* Aturan sync */}
+      <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+        <h3 className="font-bold mb-1 flex items-center gap-2"><Icon name="sliders-horizontal" className="w-4 h-4 text-brand-600" />Aturan Sinkronisasi</h3>
+        <p className="text-xs text-slate-400 mb-4">Berlaku untuk setiap pesanan yang masuk via <b>handleOrder()</b>.</p>
+        <div className="divide-y divide-slate-50">
+          {rules.map((r) => (
+            <div key={r.key} className="flex items-center gap-3 py-4">
+              <span className="w-10 h-10 rounded-xl bg-brand-50 flex items-center justify-center shrink-0"><Icon name={r.icon} className="w-5 h-5 text-brand-600" /></span>
+              <div className="flex-1 min-w-0"><div className="font-bold text-sm">{r.title}</div><div className="text-xs text-slate-500 leading-relaxed">{r.desc}</div></div>
+              <Switch checked={!!settings[r.key]} onChange={(v) => set({ [r.key]: v }, r.title + (v ? ' diaktifkan.' : ' dimatikan.'))} />
+            </div>
+          ))}
+          <div className="flex items-center gap-3 py-4">
+            <span className="w-10 h-10 rounded-xl bg-brand-50 flex items-center justify-center shrink-0"><Icon name="package" className="w-5 h-5 text-brand-600" /></span>
+            <div className="flex-1 min-w-0">
+              <div className="font-bold text-sm">Buffer stok gudang</div>
+              <div className="text-xs text-slate-500 leading-relaxed">Sisakan stok di gudang yang tidak dijual ke marketplace. Berlaku saat “Cegah overselling” aktif.</div>
+            </div>
+            <div className="flex items-center gap-2">
+              <button onClick={() => set({ buffer: Math.max(0, settings.buffer - 1) })} className="w-8 h-8 rounded-lg border border-slate-200 font-bold hover:bg-slate-50">−</button>
+              <span className="w-10 text-center font-extrabold">{settings.buffer}<span className="text-xs font-medium text-slate-400"> pcs</span></span>
+              <button onClick={() => set({ buffer: Math.min(50, settings.buffer + 1) })} className="w-8 h-8 rounded-lg border border-slate-200 font-bold hover:bg-slate-50">+</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Data */}
+      <div className="bg-white rounded-2xl border border-slate-100 p-5 shadow-sm">
+        <h3 className="font-bold mb-4 flex items-center gap-2"><Icon name="file-text" className="w-4 h-4 text-brand-600" />Data & Penyimpanan</h3>
+        <div className="grid grid-cols-3 gap-2 text-center mb-4">
+          {[['Produk', products.length, 'package'], ['Pesanan', orders.length, 'shopping-cart'], ['Log', logs.length, 'history']].map((d, i) => (
+            <div key={i} className="rounded-xl bg-slate-50 border border-slate-100 py-3">
+              <Icon name={d[2]} className="w-4 h-4 mx-auto text-slate-400 mb-1" />
+              <div className="font-extrabold">{d[1]}</div><div className="text-[11px] text-slate-400">{d[0]}</div>
+            </div>
+          ))}
+        </div>
+        <p className="text-xs text-slate-400 leading-relaxed mb-4">Data tersimpan lokal di browser ini (<span className="font-mono font-bold">localStorage: stoksync_v1</span>). Struktur skema sudah siap migrasi ke Supabase: <span className="font-mono">products, marketplaces, orders, sync_logs</span> — lihat PANDUAN.md.</p>
+        <div className="flex flex-wrap gap-2">
+          <button onClick={backup} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-slate-200 text-sm font-bold text-slate-600 hover:border-brand-400 hover:text-brand-700"><Icon name="download" className="w-4 h-4" />Unduh Backup (JSON)</button>
+          <button onClick={resetAll} className="flex items-center gap-1.5 px-4 py-2.5 rounded-xl border border-rose-200 text-sm font-bold text-rose-600 hover:bg-rose-50"><Icon name="trash-2" className="w-4 h-4" />Reset Data Demo</button>
+        </div>
+      </div>
+
+      <p className="text-center text-xs text-slate-300 pb-4">StokSync v1.0.0 • Satu Stok Untuk Semua Toko • Klaten, Indonesia</p>
+    </div>
+  );
+}
+
+/* ===================== ROOT ===================== */
+function App() {
+  const view = useStore((s) => s.view);
+  const booted = useStore((s) => s.booted);
+  useEffect(() => {
+    const t = setTimeout(() => store.setState({ booted: true }), 900);
+    return () => clearTimeout(t);
+  }, []);
+  return (
+    <React.Fragment>
+      <IconRefresher />
+      <Toasts />
+      {!booted ? <Splash /> : (view === 'app' ? <Shell /> : <Landing />)}
+    </React.Fragment>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
